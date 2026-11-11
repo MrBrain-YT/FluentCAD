@@ -118,10 +118,22 @@ class FeatureGraph:
                 source = results[feature.input_id]
             try:
                 args = feature.parameters
-                if feature.kind == 'datum_plane':
+                if feature.kind == 'frozen_body':
+                    if source is not None: raise ValueError('Frozen body cannot have an input.')
+                    from UI.model.legacy_conversion import decode_body
+                    result = decode_body(args['brep'])
+                elif feature.kind == 'datum_plane':
                     origin = tuple(number(x) for x in args.get('origin', (0, 0, 0)))
                     normal = tuple(number(x) for x in args.get('normal', (0, 0, 1)))
-                    result = cad.Plane(origin=origin, z_dir=normal)
+                    if 'face' in args:
+                        if source is None or not feature.input_id or args['face'].get('kind') != 'face':
+                            raise ValueError('Face-supported plane requires a solid face reference.')
+                        index = resolve_reference(args['face'], source, feature.input_id)
+                        face = list(source.faces())[index]
+                        if face.geom_type != cad.GeomType.PLANE: raise ValueError('Sketch support must remain planar.')
+                        origin, normal = tuple(face.center()), tuple(face.normal_at())
+                    x_dir = tuple(number(x) for x in args['x_dir']) if 'x_dir' in args else None
+                    result = cad.Plane(origin=origin, x_dir=x_dir, z_dir=normal)
                 elif feature.kind == 'rectangle_sketch':
                     if not isinstance(source, cad.Plane):
                         raise ValueError('Rectangle sketch requires a datum plane.')
@@ -136,6 +148,14 @@ class FeatureGraph:
                 elif feature.kind in ('extrude', 'revolve'):
                     if isinstance(source, ParametricSketch):
                         profile_index = args.get('profile_index', 0)
+                        key = args.get('profile_key')
+                        if key is not None:
+                            matches = [i for i, candidate in enumerate(source.profile_keys) if candidate == key]
+                            if len(matches) != 1:
+                                raise ValueError('Selected sketch profile is missing or ambiguous; reselect it.')
+                            profile_index = matches[0]
+                        elif 'profile_count' in args and args['profile_count'] != len(source.profiles):
+                            raise ValueError('Sketch profile topology changed; reselect the extrusion profile.')
                         if type(profile_index) is not int or not 0 <= profile_index < len(source.profiles):
                             raise ValueError('Sketch profile index is not available.')
                         profile = source.profiles[profile_index]
@@ -144,7 +164,15 @@ class FeatureGraph:
                     else:
                         raise ValueError('Operation requires a planar sketch profile.')
                     if feature.kind == 'extrude':
-                        result = build_extrusion(profile, tuple(profile.normal_at()), number(args['distance']))
+                        base_id = args.get('base_id')
+                        if base_id and (base_id == feature.id or base_id not in seen or base_id not in results):
+                            raise ValueError('Extrusion base body is missing or unavailable.')
+                        base = results.get(base_id) if base_id else None
+                        result = build_extrusion(profile, tuple(profile.normal_at()), number(args['distance']),
+                            args.get('operation', 'new_body'), base, number(args.get('offset', 0)),
+                            number(args.get('taper', 0)), bool(args.get('symmetric', False)),
+                            number(args['second_distance']) if args.get('second_distance') is not None else None,
+                            args.get('extent', 'distance'))
                     else:
                         origin = [number(x) for x in args.get('axis_origin', (0, 0, 0))]
                         axis = [number(x) for x in args.get('axis_direction', (0, 1, 0))]

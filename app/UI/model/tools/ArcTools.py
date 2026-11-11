@@ -37,7 +37,7 @@ class CenterArc(SkecthObj):
 
     def start(self):
         self.is_drawing = True
-        self.plotter.track_click_position(callback=self.on_click, side='left')
+        self.track_sketch_click()
         self.sketch_instance.status_callback('Arc: select center, start, then end (counterclockwise).')
 
     def on_click(self, position):

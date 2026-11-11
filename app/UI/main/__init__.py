@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 from PySide6 import QtWidgets, QtGui, QtCore
 
@@ -20,7 +21,7 @@ def open_window():
     sys.exit(app.exec())
     
 def show_splash_screen():
-    splash_pix = QtGui.QPixmap("./app/UI/images/splash.png")
+    splash_pix = QtGui.QPixmap(str(Path(__file__).resolve().parent.parent / 'images' / 'splash.png'))
     screen = QtWidgets.QApplication.primaryScreen()
     screen_geometry = screen.geometry()
     target_width = screen_geometry.width() // 3

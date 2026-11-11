@@ -3,6 +3,16 @@ import numpy as np
 from UI.model.constraints import Constraint, solve_constraints
 
 
+def history_line_points(manager):
+    graph, feature_id = manager.history_edit_graph, manager.history_edit_id
+    if graph is None or feature_id is None: return {}
+    feature = next(item for item in graph.features if item.id == feature_id)
+    solved = graph.results[feature_id].constraint_status.points
+    return {name: solved[name] for entity in feature.parameters.get('entities', [])
+            if entity.get('type') == 'line' for name in entity.get('points', [])
+            if isinstance(name, str) and name in solved}
+
+
 def line_points(manager):
     sketch = manager.get_current_sketch_data()
     result = {}

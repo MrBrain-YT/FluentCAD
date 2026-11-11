@@ -19,12 +19,13 @@ from UI.model.tools.ArcTools import CenterArc, EllipseArc
 from UI.model.tools.Curve import Curve
 from UI.model.tools.Ellipse import Ellipse
 from UI.model.tools.StraightShape import StraightShape
+from UI.model.tools.Spline import Spline
 from UI.model.profiles import build_profiles, sketch_edges, split_edges
 from UI.model.solid_operations import build_extrusion, build_revolution, build_primitive
 from UI.model.edge_selection import nearest_screen_edge, face_edge_indices
 from UI.model.sketch_constraints import line_points, add_automatic_coincidences
 from UI.model.transforms import body_index_for_face
-from UI.model.feature_graph import FeatureGraph
+from UI.model.feature_graph import Feature, FeatureGraph
 from UI.model.timeline import Timeline
 
 class ActionManager():
@@ -45,8 +46,19 @@ class ActionManager():
         self.redo_stack = []
         self.timeline = Timeline()
         self.parametric_graph = None
+        self.parametric_sketch_id = None
+        self.history_edit_id = None
+        self.history_edit_graph = None
+        self.history_origin_is_new = False
+        self.history_edit_actors = []
+        self.history_point_actors = {}
+        self.history_drag_name = None
+        self.history_drag_start = None
+        self.previous_sketch_style = None
+        self.sketch_plane_support = None
         self.graph_undo = []
         self.graph_redo = []
+        self.legacy_migration_redo = None
         self.timeline_callback = lambda: None
         self.sketch_editing = False
         self.pending_sketch = False
@@ -63,6 +75,7 @@ class ActionManager():
         self.selected_edge_indices = set()
         self.edge_selection_actors = []
         self.status_callback = lambda message: None
+        self._adjusting_clipping = False
         self.active_normal = np.array([0, 0, 1]) # Normal for connect z axis for drow sketch
         self.active_center = np.array([0, 0, 0]) # center point in active sketch
         self.u_axis = np.array([1., 0., 0.])
@@ -89,6 +102,7 @@ class ActionManager():
         self.selected_face_id = -1
         
     def activate_sketch_mode(self):
+        self.sketch_plane_support = None
         self.clear_selected_edges()
         self.edge_selection_mode = False
         self.profile_selection_callback = None
@@ -157,7 +171,23 @@ class ActionManager():
                 self.status_callback("Choose a planar face; curved faces are not supported.")
                 return
             face = faces[face_id]
-            self._start_sketch(np.array(tuple(face.normal_at())), np.array(picker.GetPickPosition()))
+            if self.parametric_graph is not None:
+                from UI.model.geometry_references import make_reference
+                source_id = next((item.id for item in reversed(self.parametric_graph.features)
+                                  if item.id in self.parametric_graph.results and self.parametric_graph.results[item.id] is self.current_part), None)
+                if source_id is None:
+                    self.status_callback('Cannot identify the parametric face source.')
+                    return
+                try:
+                    reference = make_reference(source_id, self.current_part, 'face', face_id)
+                except ValueError as exc:
+                    self.status_callback(str(exc))
+                    return
+                self.sketch_plane_support = (source_id, reference)
+                center = np.array(tuple(face.center()))
+            else:
+                center = np.array(picker.GetPickPosition())
+            self._start_sketch(np.array(tuple(face.normal_at())), center)
         else:
             mesh = pv.wrap(actor.GetMapper().GetInput())
             self.on_plane_selected(mesh)
@@ -295,7 +325,42 @@ class ActionManager():
 
         # Add event listener
         self.plotter.iren.add_observer("MouseMoveEvent", self._on_hover)
+        self.plotter.iren.add_observer("MouseMoveEvent", self._preview_history_drag)
         self.plotter.iren.add_observer("LeftButtonPressEvent", self._on_click)
+        self.plotter.iren.add_observer("LeftButtonReleaseEvent", self._finish_history_drag)
+        self.plotter.camera.AddObserver('ModifiedEvent', self.refresh_camera_clipping)
+
+    def refresh_camera_clipping(self, *args):
+        if self._adjusting_clipping or self.plotter is None: return
+        self._adjusting_clipping = True
+        try:
+            bounds = self.plotter.renderer.ComputeVisiblePropBounds()
+            if not all(np.isfinite(bounds)) or any(bounds[i] > bounds[i+1] for i in (0,2,4)):
+                return
+            self.plotter.renderer.ResetCameraClippingRange()
+            near, far = self.plotter.camera.GetClippingRange()
+            if np.isfinite(far) and far > 0:
+                self.plotter.camera.SetClippingRange(max(1e-8, min(near, far * 1e-5)), far * 1.2)
+        finally:
+            self._adjusting_clipping = False
+
+    def control_modifier_active(self):
+        iren = getattr(self.plotter, 'iren', None)
+        interactor = getattr(iren, 'interactor', None)
+        return bool(interactor.GetControlKey()) if interactor is not None else False
+
+    def lock_sketch_camera(self):
+        iren = getattr(self.plotter, 'iren', None)
+        if iren is None or not hasattr(iren, 'style') or self.previous_sketch_style is not None:
+            return
+        from UI.model.sketch_navigation import SketchCameraStyle
+        self.previous_sketch_style = iren.style
+        iren.style = SketchCameraStyle(self)
+
+    def restore_camera_style(self):
+        if self.previous_sketch_style is None: return
+        self.plotter.iren.style = self.previous_sketch_style
+        self.previous_sketch_style = None
 
     def _pick_face(self):
         main_actor = self.plotter.actors.get("main_part")
@@ -356,6 +421,11 @@ class ActionManager():
             self._select_sketch_plane()
             return
         if self.sketch_editing:
+            if self.control_modifier_active():
+                return
+            if self.history_edit_id is not None and (self.active_tool is None or not self.active_tool.is_drawing):
+                self.active_tool = None
+                self._begin_history_drag()
             return
         if self.edge_selection_mode:
             self.select_edge_at_cursor()
@@ -512,6 +582,22 @@ class ActionManager():
     def exit_sketch_mode(self):
         if not self.sketch_editing:
             return
+        if self.history_edit_id is not None:
+            self.finish_history_sketch()
+            return
+        graph = None
+        sketch_feature = None
+        if self.parametric_graph is not None or self.current_part is None:
+            from UI.model.sketch_capture import capture_sketch
+            definition = capture_sketch(self.get_current_sketch_data(), self.active_center, self.u_axis, self.v_axis)
+            plane_args = {'origin':self.active_center.tolist(), 'normal':self.active_normal.tolist(), 'x_dir':self.u_axis.tolist()}
+            support_id = None
+            if self.sketch_plane_support:
+                support_id, plane_args['face'] = self.sketch_plane_support
+            plane = Feature.create('Sketch plane', 'datum_plane', plane_args, support_id)
+            sketch_feature = Feature.create('Sketch', 'planar_sketch', definition, plane.id)
+            previous = self.parametric_graph
+            graph = FeatureGraph([*(previous.features if previous else []), plane, sketch_feature], previous.parameters if previous else {})
         self.plotter.remove_actor("sketch_grid")
         if self.constraint_glyph_actor is not None:
             self.plotter.remove_actor(self.constraint_glyph_actor)
@@ -520,7 +606,369 @@ class ActionManager():
         for tool in self.get_current_sketch_data()["sketch_func"]:
             tool.is_drawing = False
         self.sketch_editing = False
-        self.create_profile_mesh()
+        self.restore_camera_style()
+        if graph is not None:
+            self.install_parametric_graph(graph)
+            self.parametric_sketch_id = sketch_feature.id
+            self.show_parametric_profiles(sketch_feature.id)
+        else:
+            self.parametric_sketch_id = None
+            self.create_profile_mesh()
+
+    def start_history_sketch(self, feature_id):
+        if self.sketch_editing or self.pending_sketch or self.selecting_sketch_plane:
+            raise ValueError('Finish or cancel the current sketch first.')
+        if self.parametric_graph is None:
+            raise ValueError('Open a parametric model first.')
+        candidate = FeatureGraph.from_data(self.parametric_graph.to_data())
+        feature = next((item for item in candidate.features if item.id == feature_id), None)
+        sketch = candidate.results.get(feature_id)
+        if feature is None or feature.kind != 'planar_sketch' or sketch is None or sketch.constraint_status is None:
+            raise ValueError('This sketch needs active named points for scene editing.')
+        for profile in self.profiles:
+            self.plotter.remove_actor(profile['name'])
+        self.profiles = []
+        self.selected_profile_index = None
+        for actor in self.sketch_edge_actors:
+            self.plotter.remove_actor(actor, render=False)
+        self.sketch_edge_actors = []
+        for previous_sketch in self.sketchs_data.values():
+            for tool in previous_sketch['sketch_func']:
+                for actor in tool.render_obj['points']:
+                    self.plotter.remove_actor(actor, render=False)
+        self.history_edit_id, self.history_edit_graph = feature_id, candidate
+        self.history_origin_is_new = False
+        self.active_center = np.asarray(tuple(sketch.plane.origin), dtype=float)
+        self.active_normal = np.asarray(tuple(sketch.plane.z_dir), dtype=float)
+        self.u_axis = np.asarray(tuple(sketch.plane.x_dir), dtype=float)
+        self.v_axis = np.asarray(tuple(sketch.plane.y_dir), dtype=float)
+        self.activated_sketch_id = max(self.sketchs_data.keys(), default=0) + 1
+        self.sketchs_data[self.activated_sketch_id] = {'sketch_func':[], 'sketch_profiles':[], 'sketch_points':[],
+                                                        'sketch_render_obj':{'points':[], 'lines':[]}}
+        self.sketch_editing = True
+        self.pending_sketch = True
+        self.active_tool = None
+        body = self.plotter.actors.get('main_part')
+        if body is not None: body.SetVisibility(False)
+        try:
+            self.lock_sketch_camera()
+            self.align_camera_to_normal(self.active_normal)
+            self.update_grid_lod()
+            self.render_history_sketch()
+        except Exception:
+            self.cancel_history_sketch()
+            raise
+        self.status_callback('Drag sketch points, add geometry, then finish. Esc cancels when no tool is active.')
+
+    def promote_current_sketch(self):
+        if not self.sketch_editing or self.history_edit_id is not None:
+            raise ValueError('Start a new sketch first.')
+        if self.parametric_graph is None and self.current_part is not None:
+            raise ValueError('Convert the legacy model to parametric before using this command.')
+        from UI.model.sketch_capture import capture_sketch
+        sketch_data = self.get_current_sketch_data()
+        definition = capture_sketch(sketch_data, self.active_center, self.u_axis, self.v_axis)
+        if not definition['points']:
+            raise ValueError('Draw sketch geometry before using this command.')
+        args = {'origin':self.active_center.tolist(), 'normal':self.active_normal.tolist(), 'x_dir':self.u_axis.tolist()}
+        support = None
+        if self.sketch_plane_support: support, args['face'] = self.sketch_plane_support
+        plane = Feature.create('Sketch plane','datum_plane',args,support)
+        feature = Feature.create('Sketch','planar_sketch',definition,plane.id)
+        previous = self.parametric_graph
+        candidate = FeatureGraph([*(previous.features if previous else []),plane,feature], previous.parameters if previous else {})
+        self.history_edit_id, self.history_edit_graph = feature.id, candidate
+        self.history_origin_is_new = True
+        try:
+            self.render_history_sketch()
+        except Exception:
+            self.clear_history_sketch_actors()
+            self.history_edit_id = self.history_edit_graph = None
+            self.history_origin_is_new = False
+            raise
+        for actor in self.sketch_edge_actors: self.plotter.remove_actor(actor, render=False)
+        self.sketch_edge_actors = []
+        for tool in sketch_data['sketch_func']:
+            for actor in tool.render_obj['points']: self.plotter.remove_actor(actor, render=False)
+        sketch_data['sketch_func'] = []
+        sketch_data.pop('constraints', None)
+        sketch_data.pop('constraint_known_points', None)
+        if self.constraint_glyph_actor is not None:
+            self.plotter.remove_actor(self.constraint_glyph_actor, render=False)
+            self.constraint_glyph_actor = None
+        body = self.plotter.actors.get('main_part')
+        if body is not None: body.SetVisibility(False)
+        self.plotter.render()
+
+    def clear_history_sketch_actors(self):
+        for actor in self.history_edit_actors:
+            self.plotter.remove_actor(actor, render=False)
+        self.history_edit_actors = []
+        self.history_point_actors = {}
+
+    def render_history_sketch(self):
+        self.clear_history_sketch_actors()
+        sketch = self.history_edit_graph.results[self.history_edit_id]
+        for tool in sketch.tools:
+            for edge in sketch_edges([tool], self.active_normal):
+                count = max(2, min(257, int(edge.length * 8) + 2))
+                mesh = pv.lines_from_points(np.asarray([tuple(edge.position_at(t)) for t in np.linspace(0, 1, count)]))
+                actor = self.plotter.add_mesh(mesh, color='#43889d' if tool.is_construction else 'blue',
+                                              line_width=2, pickable=False, reset_camera=False, render=False)
+                self.history_edit_actors.append(actor)
+            if tool.type in ('spline','fit_spline','nurbs','periodic_nurbs') and len(tool.points) >= 2:
+                controls = [np.asarray(point, dtype=float) for point in tool.points]
+                if tool.type == 'periodic_nurbs': controls.append(controls[0])
+                vertices, cells = [], []
+                for a, b in zip(controls, controls[1:]):
+                    for i in range(0, 8, 2):
+                        start = len(vertices)
+                        vertices.extend((a+(b-a)*i/8, a+(b-a)*(i+1)/8))
+                        cells.extend((2, start, start+1))
+                mesh = pv.PolyData(np.asarray(vertices)); mesh.lines = np.asarray(cells, dtype=np.int64)
+                actor = self.plotter.add_mesh(mesh, color='#94a5af', line_width=1,
+                                              pickable=False, reset_camera=False, render=False)
+                self.history_edit_actors.append(actor)
+        for name, point in sketch.constraint_status.points.items():
+            world = self.get_global_pos_in_sketch(point)
+            actor = self.plotter.add_points(world, color='#1785ae', point_size=12, pickable=True,
+                                            reset_camera=False, render=False)
+            self.history_edit_actors.append(actor)
+            self.history_point_actors[name] = actor
+        from UI.model.parametric_sketch import circle_radius_name
+        feature = next(item for item in self.history_edit_graph.features if item.id == self.history_edit_id)
+        for index, entity in enumerate(feature.parameters.get('entities', [])):
+            if entity.get('type') != 'circle' or not isinstance(entity.get('center'), str): continue
+            center = sketch.constraint_status.points[entity['center']]
+            radius = sketch.constraint_status.radii[circle_radius_name(index)]
+            world = self.get_global_pos_in_sketch(center + np.array([radius, 0.]))
+            actor = self.plotter.add_points(world, color='#e39832', point_size=12, pickable=True,
+                                            reset_camera=False, render=False)
+            self.history_edit_actors.append(actor)
+            self.history_point_actors[('radius', index, entity['center'])] = actor
+        glyphs, labels = [], []
+        for constraint in feature.parameters.get('constraints', []):
+            refs = constraint.get('entities', [])
+            first = refs[0] if refs else None
+            if isinstance(first, (list, tuple)) and first: first = first[0]
+            if not isinstance(first, str) or first not in sketch.constraint_status.points: continue
+            glyphs.append(self.get_global_pos_in_sketch(sketch.constraint_status.points[first]))
+            value = constraint.get('value')
+            labels.append(str(constraint.get('kind', 'constraint')) + (f' {value}' if value is not None else ''))
+        if glyphs and hasattr(self.plotter, 'add_point_labels'):
+            actor = self.plotter.add_point_labels(np.asarray(glyphs), labels, font_size=11,
+                show_points=False, shape=None, always_visible=True, pickable=False)
+            self.history_edit_actors.append(actor)
+        self.plotter.render()
+
+    def _begin_history_drag(self):
+        self.history_drag_name = self._history_handle_at_cursor()
+        self.history_drag_start = self.plotter.iren.get_event_position() if self.history_drag_name is not None else None
+
+    def _history_handle_at_cursor(self):
+        from UI.model.parametric_sketch import circle_radius_name
+        state = self.history_edit_graph.results[self.history_edit_id].constraint_status
+        cursor = np.asarray(self.plotter.iren.get_event_position(), dtype=float)
+        renderer = self.plotter.renderer
+        nearest, best = None, 12.0
+        for name in self.history_point_actors:
+            if isinstance(name, tuple):
+                point = state.points[name[2]] + np.array([state.radii[circle_radius_name(name[1])], 0.])
+            else:
+                point = state.points[name]
+            world = self.get_global_pos_in_sketch(point)
+            renderer.SetWorldPoint(float(world[0]), float(world[1]), float(world[2]), 1.)
+            renderer.WorldToDisplay()
+            display = renderer.GetDisplayPoint()
+            if not 0 <= display[2] <= 1: continue
+            distance = float(np.linalg.norm(np.asarray(display[:2]) - cursor))
+            if distance <= best:
+                nearest, best = name, distance
+        return nearest
+
+    def _preview_history_drag(self, *args):
+        if self.history_drag_name is None or self.history_edit_id is None: return
+        try:
+            world = self._screen_to_sketch_plane()
+            state = self.history_edit_graph.results[self.history_edit_id].constraint_status
+            name = self.history_drag_name
+            if isinstance(name, tuple):
+                from UI.model.parametric_sketch import circle_radius_name
+                original = state.points[name[2]] + np.array([state.radii[circle_radius_name(name[1])], 0.])
+            else:
+                original = state.points[name]
+            delta = world - self.get_global_pos_in_sketch(original)
+            self.history_point_actors[name].SetPosition(*delta)
+            self.plotter.render()
+        except (ValueError, KeyError):
+            pass
+
+    def _screen_to_sketch_plane(self):
+        x, y = self.plotter.iren.get_event_position()
+        renderer = self.plotter.renderer
+        points = []
+        for depth in (0., 1.):
+            renderer.SetDisplayPoint(x, y, depth)
+            renderer.DisplayToWorld()
+            world = np.asarray(renderer.GetWorldPoint(), dtype=float)
+            if abs(world[3]) < 1e-12: raise ValueError('Cannot project pointer to the sketch plane.')
+            points.append(world[:3] / world[3])
+        direction = points[1] - points[0]
+        denominator = np.dot(direction, self.active_normal)
+        if abs(denominator) < 1e-12: raise ValueError('View is parallel to the sketch plane.')
+        return points[0] + direction * (np.dot(self.active_center-points[0], self.active_normal) / denominator)
+
+    def _finish_history_drag(self, *args):
+        name, self.history_drag_name = self.history_drag_name, None
+        start, self.history_drag_start = self.history_drag_start, None
+        if name is None or self.history_edit_id is None: return
+        try:
+            if start is not None and np.linalg.norm(np.asarray(self.plotter.iren.get_event_position()) - np.asarray(start)) < 3:
+                self.history_point_actors[name].SetPosition(0, 0, 0)
+                return
+            position = self.get_local_pos_in_sketch(self._screen_to_sketch_plane())
+            if isinstance(name, tuple):
+                from UI.model.sketch_drag import set_circle_radius
+                center = self.history_edit_graph.results[self.history_edit_id].constraint_status.points[name[2]]
+                self.history_edit_graph = set_circle_radius(self.history_edit_graph, self.history_edit_id, name[1],
+                                                            float(np.linalg.norm(position - center)))
+                self.render_history_sketch()
+                self.status_callback('Circle radius updated. Finish the sketch to apply.')
+            else:
+                self.move_history_point(name, position)
+        except Exception as exc:
+            if name in self.history_point_actors:
+                self.history_point_actors[name].SetPosition(0, 0, 0)
+                self.plotter.render()
+            self.status_callback(str(exc))
+
+    def move_history_point(self, name, position):
+        from UI.model.sketch_drag import move_sketch_point
+        candidate = move_sketch_point(self.history_edit_graph, self.history_edit_id, name, position)
+        self.history_edit_graph = candidate
+        self.render_history_sketch()
+        self.status_callback('Sketch point updated. Finish the sketch to apply.')
+
+    def merged_history_graph(self):
+        from copy import deepcopy
+        from UI.model.sketch_capture import capture_sketch
+        feature_id = self.history_edit_id
+        candidate = FeatureGraph.from_data(self.history_edit_graph.to_data())
+        new = capture_sketch(self.get_current_sketch_data(), self.active_center, self.u_axis, self.v_axis)
+        if new['points'] or new['entities'] or new['constraints']:
+            feature = next(item for item in candidate.features if item.id == feature_id)
+            params = deepcopy(feature.parameters)
+            mapping = {}
+            for name in new['points']:
+                number = 1
+                while f'N{number}_{name}' in params['points']: number += 1
+                mapping[name] = f'N{number}_{name}'
+            def remap(value):
+                if isinstance(value, str): return mapping.get(value, value)
+                if isinstance(value, (tuple, list)): return [remap(item) for item in value]
+                return value
+            params['points'].update({mapping[name]: point for name, point in new['points'].items()})
+            old_points = candidate.results[feature_id].constraint_status.points
+            for name, point in new['points'].items():
+                matching = [old for old, position in old_points.items() if np.linalg.norm(np.asarray(point)-position) < 1e-7]
+                if matching:
+                    params.setdefault('constraints', []).append({'kind':'coincident', 'entities':[mapping[name], sorted(matching)[0]]})
+            for entity in new['entities']:
+                entity = deepcopy(entity)
+                if 'points' in entity: entity['points'] = remap(entity['points'])
+                if 'center' in entity: entity['center'] = remap(entity['center'])
+                params['entities'].append(entity)
+            for constraint in new['constraints']:
+                constraint = deepcopy(constraint); constraint['entities'] = remap(constraint['entities'])
+                params.setdefault('constraints', []).append(constraint)
+            candidate.edit(feature_id, parameters=params)
+        return candidate
+
+    def flush_history_tools(self):
+        candidate = self.merged_history_graph()
+        sketch = self.get_current_sketch_data()
+        for actor in self.sketch_edge_actors: self.plotter.remove_actor(actor, render=False)
+        self.sketch_edge_actors = []
+        for tool in sketch['sketch_func']:
+            for actor in tool.render_obj['points']: self.plotter.remove_actor(actor, render=False)
+        sketch['sketch_func'] = []
+        sketch.pop('constraints', None)
+        sketch.pop('constraint_known_points', None)
+        if self.constraint_glyph_actor is not None:
+            self.plotter.remove_actor(self.constraint_glyph_actor, render=False)
+            self.constraint_glyph_actor = None
+        self.history_edit_graph = candidate
+        self.render_history_sketch()
+
+    def finish_history_sketch(self):
+        feature_id = self.history_edit_id
+        candidate = self.merged_history_graph()
+        self.install_parametric_graph(candidate, allow_empty=True)
+        self.clear_history_sketch_actors()
+        for actor in self.sketch_edge_actors: self.plotter.remove_actor(actor, render=False)
+        self.sketch_edge_actors = []
+        for tool in self.get_current_sketch_data()['sketch_func']:
+            for actor in tool.render_obj['points']: self.plotter.remove_actor(actor, render=False)
+        self.plotter.remove_actor('sketch_grid')
+        if self.constraint_glyph_actor is not None:
+            self.plotter.remove_actor(self.constraint_glyph_actor); self.constraint_glyph_actor = None
+        self.plotter.disable_picking()
+        self.sketch_editing = False
+        self.pending_sketch = False
+        self.restore_camera_style()
+        self.history_edit_id = self.history_edit_graph = None
+        self.history_origin_is_new = False
+        self.history_drag_name = self.history_drag_start = None
+        self.sketchs_data.pop(self.activated_sketch_id, None)
+        self.activated_sketch_id = None
+        self.show_parametric_profiles(feature_id)
+
+    def cancel_history_sketch(self):
+        if self.history_edit_id is None: return False
+        feature_id = self.history_edit_id
+        was_new = self.history_origin_is_new
+        self.clear_history_sketch_actors()
+        self.plotter.remove_actor('sketch_grid')
+        if self.constraint_glyph_actor is not None:
+            self.plotter.remove_actor(self.constraint_glyph_actor, render=False)
+            self.constraint_glyph_actor = None
+        for actor in self.sketch_edge_actors: self.plotter.remove_actor(actor, render=False)
+        self.sketch_edge_actors = []
+        for tool in self.get_current_sketch_data()['sketch_func']:
+            for actor in tool.render_obj['points']: self.plotter.remove_actor(actor, render=False)
+        self.plotter.disable_picking()
+        self.sketchs_data.pop(self.activated_sketch_id, None)
+        self.activated_sketch_id = None
+        self.sketch_editing = self.pending_sketch = False
+        self.restore_camera_style()
+        self.history_edit_id = self.history_edit_graph = self.history_drag_name = self.history_drag_start = None
+        self.history_origin_is_new = False
+        body = self.plotter.actors.get('main_part')
+        if body is not None: body.SetVisibility(True)
+        if not was_new: self.show_parametric_profiles(feature_id)
+        self.plotter.render()
+        self.status_callback('Sketch edits cancelled.')
+        return True
+
+    def show_parametric_profiles(self, feature_id):
+        sketch = self.parametric_graph.results.get(feature_id)
+        if sketch is None or not hasattr(sketch, 'profiles'):
+            raise ValueError('The parametric sketch is unavailable.')
+        for profile in self.profiles:
+            self.plotter.remove_actor(profile['name'])
+        self.profiles, self.selected_profile_index = [], None
+        self.active_normal = np.asarray(tuple(sketch.plane.z_dir), dtype=float)
+        self.active_center = np.asarray(tuple(sketch.plane.origin), dtype=float)
+        self.u_axis = np.asarray(tuple(sketch.plane.x_dir), dtype=float)
+        self.v_axis = np.asarray(tuple(sketch.plane.y_dir), dtype=float)
+        self.parametric_sketch_id = feature_id
+        for index, face in enumerate(sketch.profiles):
+            name = f'parametric_profile_{feature_id}_{index}'
+            actor = self.plotter.add_mesh(b123d_to_pro_mesh(face), color='#3498db', opacity=.45,
+                                          name=name, pickable=True, reset_camera=False)
+            actor.SetPosition(*(self.active_normal * 1e-4))
+            self.profiles.append({'name':name, 'face':face, 'sketch_id':feature_id, 'profile_index':index})
+        return self.profiles
 
     def create_offset_plane(self, base, offset, origin=None, normal=None):
         normals = {"XY": (0, 0, 1), "XZ": (0, 1, 0), "YZ": (1, 0, 0)}
@@ -627,6 +1075,7 @@ class ActionManager():
         
         self.sketch_editing = True
         self.pending_sketch = True
+        self.lock_sketch_camera()
         self.sketch_intersection_points = []
         self.active_normal = np.asarray(normal, dtype=float)
         self.active_center = np.array(central_point)
@@ -708,6 +1157,9 @@ class ActionManager():
         # Existing points take priority; choose the nearest, not the first one.
         if self.snap_to_points:
             points = self.get_active_sketch_points() + self.sketch_intersection_points
+            if self.history_edit_graph is not None and self.history_edit_id is not None:
+                state = self.history_edit_graph.results[self.history_edit_id].constraint_status
+                points += [self.get_global_pos_in_sketch(point) for point in state.points.values()]
             if points:
                 nearest = min(points, key=lambda point: np.linalg.norm(p_on_plane - point))
                 point_radius = self.plotter.camera.parallel_scale * 0.025
@@ -842,6 +1294,35 @@ class ActionManager():
         return build_extrusion(self.profiles[index]["face"], self.active_normal, amount,
                                operation, getattr(self, "current_part", None), offset, taper, symmetric, second_distance, extent)
 
+    def commit_parametric_extrusion(self, index, distance, operation='new_body', offset=0.0,
+                                    taper=0.0, symmetric=False, second_distance=None, extent='distance'):
+        if self.parametric_graph is None or not 0 <= index < len(self.profiles):
+            raise ValueError('Select a parametric sketch profile.')
+        profile = self.profiles[index]
+        sketch_id = profile.get('sketch_id')
+        if not sketch_id or sketch_id not in self.parametric_graph.results:
+            raise ValueError('The selected profile is not part of a parametric sketch.')
+        base_id = next((item.id for item in reversed(self.parametric_graph.features)
+                        if item.id in self.parametric_graph.results and
+                        hasattr(self.parametric_graph.results[item.id], 'solids') and
+                        self.parametric_graph.results[item.id].solids()), None)
+        args = {'distance':float(distance), 'profile_index':profile['profile_index'], 'operation':operation,
+                'profile_count':len(self.parametric_graph.results[sketch_id].profiles),
+                'offset':float(offset), 'taper':float(taper), 'symmetric':bool(symmetric),
+                'second_distance':float(second_distance) if second_distance is not None else None, 'extent':extent}
+        keys = self.parametric_graph.results[sketch_id].profile_keys
+        key = keys[profile['profile_index']]
+        if key is not None:
+            args['profile_key'] = key
+        elif len(keys) > 1:
+            raise ValueError('The selected profile cannot be identified unambiguously after rebuild.')
+        if base_id: args['base_id'] = base_id
+        feature = Feature.create('Extrude', 'extrude', args, sketch_id)
+        graph = FeatureGraph([*self.parametric_graph.features, feature], self.parametric_graph.parameters)
+        self.install_parametric_graph(graph)
+        self.parametric_sketch_id = None
+        return feature.id
+
     def extrude_profile(self, index, amount, operation="new_body", offset=0.0,
                         taper=0.0, symmetric=False, second_distance=None, extent="distance"):
         result = self.build_extrusion(index, amount, operation, offset, taper, symmetric, second_distance, extent)
@@ -858,15 +1339,35 @@ class ActionManager():
     def build_primitive(self, kind, dimensions, position, operation):
         return build_primitive(kind, dimensions, position, operation, self.current_part)
 
-    def install_parametric_graph(self, graph, record=True, reset_history=False):
+    def convert_legacy_model(self):
+        if self.parametric_graph is not None: raise ValueError('This model is already parametric.')
+        if self.sketch_editing or self.pending_sketch or self.selecting_sketch_plane:
+            raise ValueError('Finish or cancel the current sketch first.')
+        from UI.model.legacy_conversion import convert_snapshot
+        graph = convert_snapshot(self.current_part, self.undo_stack, self.redo_stack,
+                                 {'entries': self.timeline.entries, 'cursor': self.timeline.cursor})
+        self.install_parametric_graph(graph, reset_history=True)
+        self.legacy_migration_redo = None
+        self.status_callback('Model converted; existing solid is a frozen base. Undo restores the snapshot history.')
+
+    def install_parametric_graph(self, graph, record=True, reset_history=False, allow_empty=False):
         # Rebuild has already succeeded; choose the last available solid result.
         solid = next((graph.results[item.id] for item in reversed(graph.features)
                       if item.id in graph.results and hasattr(graph.results[item.id], 'solids')
                       and graph.results[item.id].solids()), None)
-        if solid is None:
+        if solid is None and self.current_part is not None and not allow_empty:
             raise ValueError('The graph has no active solid result.')
         previous = self.parametric_graph.to_data() if self.parametric_graph is not None else None
-        self.display_result(solid)
+        if solid is not None:
+            self.display_result(solid)
+        else:
+            self.plotter.remove_actor('main_part')
+            self.current_part = None
+            self.pending_sketch = False
+            for profile in self.profiles:
+                self.plotter.remove_actor(profile['name'])
+            self.profiles = []
+            self.selected_profile_index = None
         self.parametric_graph = graph
         if reset_history or previous is None:
             self.graph_undo.clear()
@@ -889,6 +1390,7 @@ class ActionManager():
         self.display_result(part)
         self.undo_stack.append(previous)
         self.redo_stack.clear()
+        self.legacy_migration_redo = None
         self.timeline.append(record['title'], record['parameters'])
         self.timeline_callback()
 
@@ -906,13 +1408,33 @@ class ActionManager():
             self.plotter.render()
 
     def undo_solid(self):
+        if self.sketch_editing or self.selecting_sketch_plane or self.pending_sketch:
+            self.status_callback('Finish or cancel the current sketch before undo.')
+            return False
         if self.parametric_graph is not None:
             if not self.graph_undo:
+                if len(self.parametric_graph.features) == 1 and self.parametric_graph.features[0].kind == 'frozen_body' and 'legacy_backup' in self.parametric_graph.features[0].parameters:
+                    from UI.model.legacy_conversion import restore_snapshot
+                    graph_data = self.parametric_graph.to_data()
+                    body, undo, redo, timeline = restore_snapshot(self.parametric_graph)
+                    self.display_result(body)
+                    self.parametric_graph = None
+                    self.undo_stack, self.redo_stack = undo, redo
+                    self.timeline = Timeline()
+                    self.timeline.entries, self.timeline.cursor = timeline['entries'], timeline['cursor']
+                    self.legacy_migration_redo = graph_data
+                    self.timeline_callback()
+                    self.status_callback('Legacy model and its snapshot history restored.')
+                    return True
                 self.status_callback("Nothing to undo.")
                 return False
             previous = self.parametric_graph.to_data()
             target = FeatureGraph.from_data(self.graph_undo[-1])
-            self.install_parametric_graph(target, record=False)
+            self.install_parametric_graph(target, record=False, allow_empty=True)
+            if self.current_part is None:
+                sketch_id = next((item.id for item in reversed(target.features)
+                                  if item.kind == 'planar_sketch' and item.id in target.results), None)
+                if sketch_id: self.show_parametric_profiles(sketch_id)
             self.graph_undo.pop()
             self.graph_redo.append(previous)
             self.status_callback("Parametric edit undone.")
@@ -926,6 +1448,7 @@ class ActionManager():
         target = self.undo_stack[-1]
         current = self.current_part
         self._restore_result(target)
+        self.legacy_migration_redo = None
         self.undo_stack.pop()
         self.redo_stack.append(current)
         self.timeline.undo()
@@ -934,16 +1457,29 @@ class ActionManager():
         return True
 
     def redo_solid(self):
+        if self.sketch_editing or self.selecting_sketch_plane or self.pending_sketch:
+            self.status_callback('Finish or cancel the current sketch before redo.')
+            return False
         if self.parametric_graph is not None:
             if not self.graph_redo:
                 self.status_callback("Nothing to redo.")
                 return False
             previous = self.parametric_graph.to_data()
             target = FeatureGraph.from_data(self.graph_redo[-1])
-            self.install_parametric_graph(target, record=False)
+            self.install_parametric_graph(target, record=False, allow_empty=True)
+            if self.current_part is None:
+                sketch_id = next((item.id for item in reversed(target.features)
+                                  if item.kind == 'planar_sketch' and item.id in target.results), None)
+                if sketch_id: self.show_parametric_profiles(sketch_id)
             self.graph_redo.pop()
             self.graph_undo.append(previous)
             self.status_callback("Parametric edit redone.")
+            return True
+        if self.legacy_migration_redo is not None:
+            graph = FeatureGraph.from_data(self.legacy_migration_redo)
+            self.install_parametric_graph(graph, reset_history=True)
+            self.legacy_migration_redo = None
+            self.status_callback('Legacy model converted to a frozen parametric base.')
             return True
         if self.sketch_editing or self.selecting_sketch_plane or self.pending_sketch or self.profiles:
             self.status_callback("Finish or cancel the current sketch before redoing a solid operation.")
@@ -1061,6 +1597,13 @@ class ActionManager():
         line.is_construction = self.construction_mode
         self.active_tool = line
         line.create_line()
+
+    def activate_spline_mode(self, kind):
+        tool = Spline(self.plotter, self.get_current_sketch_data(), self, kind)
+        self.get_current_sketch_data()['sketch_func'].append(tool)
+        tool.is_construction = self.construction_mode
+        self.active_tool = tool
+        tool.start()
         
     def activate_circle_mode(self):
         circle = Circle(self.plotter, self.sketchs_data[self.activated_sketch_id], self)

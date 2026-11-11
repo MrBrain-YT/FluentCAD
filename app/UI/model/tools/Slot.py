@@ -27,6 +27,30 @@ def slot_edges(points, normal, tolerance=1e-6):
             cad.Edge.make_three_point_arc(tuple(d), tuple(start - radius * direction), tuple(a))]
 
 
+def polyline_slot_edges(points, normal, radius, tolerance=1e-6):
+    """Boundary of the union of round-ended slots along a polyline."""
+    points = [np.asarray(point, dtype=float) for point in points]
+    normal = np.asarray(normal, dtype=float)
+    if len(points) < 2 or len(points) > 100 or not np.isfinite(radius) or radius <= tolerance:
+        raise ValueError('Polyline slot requires 2 to 100 points and a positive radius.')
+    faces = []
+    for start, end in zip(points, points[1:]):
+        direction = end - start
+        length = np.linalg.norm(direction)
+        if length <= tolerance: raise ValueError('Adjacent slot path points must be distinct.')
+        perpendicular = np.cross(normal, direction / length)
+        if np.linalg.norm(perpendicular) <= tolerance: raise ValueError('Slot path must lie in its plane.')
+        perpendicular /= np.linalg.norm(perpendicular)
+        edges = slot_edges((start, end, start + radius * perpendicular), normal, tolerance)
+        faces.append(cad.Face(cad.Wire.combine(edges)[0]))
+    result = faces[0]
+    for face in faces[1:]:
+        result = result.fuse(face).clean()
+    if not result.is_valid or not result.faces():
+        raise ValueError('Unable to construct a valid composite slot.')
+    return [edge for face in result.faces() for edge in face.edges()]
+
+
 def normalize_slot_points(points, normal, mode):
     first, second, width_point = (np.asarray(p, dtype=float) for p in points)
     direction = second - first
@@ -60,7 +84,7 @@ class Slot(SkecthObj):
 
     def start(self):
         self.is_drawing = True
-        self.plotter.track_click_position(callback=self.on_click, side='left')
+        self.track_sketch_click()
         self.sketch_instance.status_callback('Slot: select two defining points, then set the width.')
 
     def on_click(self, position):

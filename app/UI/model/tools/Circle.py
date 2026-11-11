@@ -30,7 +30,7 @@ class Circle(SkecthObj):
     
     def create_circle(self):
         self.is_drawing = True
-        self.plotter.track_click_position(callback=self.on_click, side='left')
+        self.track_sketch_click()
         if type(self) is Circle:
             self.preview_observer = self.plotter.iren.add_observer('MouseMoveEvent', self.draw_preview_line)
         # self.plotter.track_click_position(callback=self.stop_drawing_line, side='right')

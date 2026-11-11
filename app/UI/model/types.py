@@ -15,3 +15,10 @@ class SkecthObj():
     sketch_instance:'ActionManager'
     render_obj:dict[str, list[pv.Actor]]
     points:list = field(default_factory=list)
+
+    def track_sketch_click(self):
+        def on_click(position):
+            control = getattr(self.sketch_instance, 'control_modifier_active', lambda: False)
+            if not control():
+                self.on_click(position)
+        self.plotter.track_click_position(callback=on_click, side='left')

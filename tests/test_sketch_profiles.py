@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from build123d import extrude, Box, Cylinder, Sphere, Face, Plane, Align, Pos, Rot, import_step, import_stl
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 from UI.model.profiles import build_profiles, sketch_edges, split_edges
@@ -18,7 +18,7 @@ from UI.model.export import export_body
 from UI.model.snapshot import save_snapshot, load_snapshot
 from UI.model.timeline import Timeline, validate_timeline
 from UI.model.feature_graph import Feature, FeatureGraph, RebuildError, resolve_parameters
-from UI.model.sketch_drag import move_sketch_point, set_circle_radius, add_sketch_constraint
+from UI.model.sketch_drag import move_sketch_point, set_circle_radius, add_sketch_constraint, remove_sketch_constraint, edit_nurbs_parameters
 from UI.model.geometry_references import make_reference, resolve_reference
 from UI.model.measurement import measure_face, measure_model, measure_edges
 from UI.model.expressions import evaluate_expression
@@ -28,7 +28,7 @@ from UI.model.transforms import move_copy, scale_model, mirror_model, rectangula
 from UI.model.surface_operations import fillet_all, chamfer_all, shell_face, offset_solid, hole_at_face_center, fillet_edges, chamfer_edges
 from UI.model.edge_selection import nearest_screen_edge, face_edge_indices
 from UI.main.content import LayoutManager
-from UI.main.extrude_handle import world_per_pixel, ExtrudeHandle, MoveAxisHandles, ParameterHandles, OperationHandle, projected_ring_angle
+from UI.main.extrude_handle import world_per_pixel, ExtrudeHandle, MoveAxisHandles, ParameterHandles, OperationHandle, projected_ring_angle, projected_axis_delta
 from UI.model.tools.StraightShape import shape_points
 from UI.model.tools.PointCircle import circle_from_points
 from UI.model.tools.Slot import slot_edges, normalize_slot_points
@@ -1105,6 +1105,12 @@ class EditorConstraintBridgeTest(unittest.TestCase):
 
 
 class ExtrusionHandleTest(unittest.TestCase):
+    def test_projected_axis_follows_direction_and_ignores_perpendicular_motion(self):
+        self.assertAlmostEqual(projected_axis_delta((0, 0), (50, 20), (0, 0), (100, 0), 2), 1)
+        self.assertAlmostEqual(projected_axis_delta((0, 0), (50, 20), (0, 0), (-100, 0), 2), -1)
+        self.assertAlmostEqual(projected_axis_delta((0, 0), (10, 10), (0, 0), (20, 20), 4), 2)
+        self.assertEqual(projected_axis_delta((0, 0), (10, 10), (0, 0), (1, 1), 4), 0)
+
     def test_scale_follows_zoom_and_projection(self):
         camera = SimpleNamespace(GetParallelProjection=lambda: True, GetParallelScale=lambda: 10.)
         self.assertAlmostEqual(world_per_pixel(camera, 1000), .02)
@@ -1120,12 +1126,48 @@ class ExtrusionHandleTest(unittest.TestCase):
         plotter = SimpleNamespace(camera=camera, iren=SimpleNamespace(get_event_position=lambda: (0, 150)),
                                   ren_win=SimpleNamespace(GetSize=lambda: (1000, 1000)))
         field = SimpleNamespace(setValue=Mock())
-        handle.plotter, handle.dialog = plotter, SimpleNamespace(distance=field)
-        handle.drag_start, handle.updating, handle.sync = (100, 3.), False, Mock()
+        handle.plotter, handle.dialog = plotter, SimpleNamespace(distance=field, direction=SimpleNamespace(currentData=lambda: 'one'))
+        handle.drag_start, handle.updating, handle.sync = ('primary', (0, 100), 3., ((0, 0), (0, 100), 2.)), False, Mock()
         handle.drag()
         field.setValue.assert_called_once_with(4.)
         handle.sync.assert_called_once()
         self.assertFalse(handle.updating)
+
+    def test_two_sided_extrude_controls_each_distance(self):
+        handle = ExtrudeHandle.__new__(ExtrudeHandle)
+        first, second = SimpleNamespace(setValue=Mock()), SimpleNamespace(setValue=Mock())
+        handle.dialog = SimpleNamespace(distance=first, second_distance=second,
+                                        direction=SimpleNamespace(currentData=lambda: 'two'))
+        handle.plotter = SimpleNamespace(iren=SimpleNamespace(get_event_position=lambda: (-50, 0)))
+        handle.drag_start = ('opposite', (0, 0), 3., ((0, 0), (-100, 0), 2.))
+        handle.updating, handle.sync = False, Mock()
+        handle.drag('opposite')
+        second.setValue.assert_called_once_with(4.)
+        first.setValue.assert_not_called()
+
+    def test_two_sided_and_symmetric_show_second_handle(self):
+        handle = ExtrudeHandle.__new__(ExtrudeHandle)
+        mode = ['two']
+        handle.dialog = SimpleNamespace(extent=SimpleNamespace(currentData=lambda: 'distance'),
+            direction=SimpleNamespace(currentData=lambda: mode[0]),
+            offset=SimpleNamespace(value=lambda: 0.), distance=SimpleNamespace(value=lambda: 3.),
+            second_distance=SimpleNamespace(value=lambda: 5.), manager=SimpleNamespace())
+        handle.anchor, handle.normal = np.zeros(3), np.array([1., 0., 0.])
+        handle.widgets = {key: SimpleNamespace(SetEnabled=Mock()) for key in ('primary', 'opposite')}
+        handle.representations = {key: SimpleNamespace(SetWorldPosition=Mock()) for key in handle.widgets}
+        camera = SimpleNamespace(GetParallelProjection=lambda: True, GetParallelScale=lambda: 10., position=(0, 0, 10))
+        handle.plotter = SimpleNamespace(camera=camera, ren_win=SimpleNamespace(GetSize=lambda: (800, 600)),
+                                         remove_actor=Mock(), add_mesh=Mock(), render=Mock())
+        handle.updating = False
+        handle.sync()
+        handle.widgets['opposite'].SetEnabled.assert_called_with(True)
+        handle.representations['opposite'].SetWorldPosition.assert_called_with((-5., 0., 0.))
+        mode[0] = 'symmetric'
+        handle.sync()
+        handle.representations['opposite'].SetWorldPosition.assert_called_with((-3., 0., 0.))
+        mode[0] = 'one'
+        handle.sync()
+        handle.widgets['opposite'].SetEnabled.assert_called_with(False)
 
 
 class MoveHandleTest(unittest.TestCase):
@@ -1138,7 +1180,7 @@ class MoveHandleTest(unittest.TestCase):
         handle.plotter, handle.dialog = plotter, SimpleNamespace(controls=fields)
         handle.updating, handle.sync = False, Mock()
         for axis in 'XYZ':
-            handle.drag_start = (axis, 100, 3.)
+            handle.drag_start = (axis, (0, 100), 3., ((0, 0), (0, 100), 2.))
             handle.drag(axis)
             fields['d' + axis].setValue.assert_called_once_with(4.)
         self.assertEqual(handle.sync.call_count, 3)
@@ -1164,11 +1206,11 @@ class RotationAndScaleHandleTest(unittest.TestCase):
         handle = ParameterHandles.__new__(ParameterHandles)
         handle.plotter, handle.dialog = plotter, SimpleNamespace(controls={'rZ': rotation, 'factor': scale})
         handle.updating, handle.sync = False, Mock()
-        handle.mode, handle.drag_start = 'rotate', ('Z', 100, 10., 350.)
+        handle.mode, handle.drag_start = 'rotate', ('Z', (0, 100), 10., 350., None, 1.)
         handle.cursor_ring_angle = Mock(return_value=10.)
         handle.drag('Z')
         rotation.setValue.assert_called_once_with(30.)
-        handle.mode, handle.drag_start = 'scale', ('S', 100, 1., None)
+        handle.mode, handle.drag_start = 'scale', ('S', (0, 100), 1., None, ((0, 0), (0, 80), 1.), 1.)
         handle.drag('S')
         scale.setValue.assert_called_once_with(1.25)
 
@@ -1180,7 +1222,7 @@ class OperationHandleTest(unittest.TestCase):
                                   ren_win=SimpleNamespace(GetSize=lambda: (1000, 1000)))
         handle = OperationHandle.__new__(OperationHandle)
         handle.plotter, handle.field, handle.angle = plotter, SimpleNamespace(setValue=Mock()), False
-        handle.drag_start, handle.updating, handle.sync = (100, 3., None), False, Mock()
+        handle.drag_start, handle.updating, handle.sync = ((0, 100), 3., None, ((0, 0), (0, 100), 2.)), False, Mock()
         handle.drag()
         handle.field.setValue.assert_called_once_with(4.)
         handle.sync.assert_called_once()
@@ -1189,7 +1231,7 @@ class OperationHandleTest(unittest.TestCase):
         handle = OperationHandle.__new__(OperationHandle)
         handle.plotter = SimpleNamespace(iren=SimpleNamespace(get_event_position=lambda: (0, 150)))
         handle.field, handle.angle = SimpleNamespace(setValue=Mock()), True
-        handle.drag_start, handle.updating, handle.sync = (100, 10., 350.), False, Mock()
+        handle.drag_start, handle.updating, handle.sync = ((0, 100), 10., 350., None), False, Mock()
         handle.cursor_angle = Mock(return_value=10.)
         handle.drag()
         handle.field.setValue.assert_called_once_with(30.)
@@ -1201,7 +1243,8 @@ class OperationHandleTest(unittest.TestCase):
         handle.name = 'temporary'
         handle.close()
         handle.widget.EnabledOff.assert_called_once()
-        handle.plotter.remove_actor.assert_called_once_with('temporary', render=False)
+        self.assertEqual(handle.plotter.remove_actor.call_count, 3)
+        handle.plotter.remove_actor.assert_any_call('temporary', render=False)
 
 
 class TimelineTest(unittest.TestCase):
@@ -1330,6 +1373,463 @@ class ParametricSketchChainTest(unittest.TestCase):
 
 
 class ParametricEditorIntegrationTest(unittest.TestCase):
+    def test_scene_spline_tools_capture_all_types(self):
+        from UI.model.tools.Spline import Spline
+        from UI.model.sketch_capture import capture_sketch
+        points = [np.array([0.,0.,0.]), np.array([2.,0.,0.]), np.array([3.,1.,0.]), np.array([4.,2.,0.])]
+        for kind in ('spline','fit_spline','nurbs','periodic_nurbs'):
+            plotter = SimpleNamespace(track_click_position=Mock(), add_points=Mock(side_effect=lambda *a,**k:Mock()), disable_picking=Mock())
+            owner = SimpleNamespace(get_snapped_pos=lambda value:(value,value[:2]), redraw_sketch_geometry=Mock(),
+                                    status_callback=Mock(), control_modifier_active=lambda:False)
+            tool = Spline(plotter, {}, owner, kind); tool.is_construction=True; tool.start()
+            for point in points: tool.on_click(point)
+            tool.stop_drawing()
+            captured = capture_sketch({'sketch_func':[tool]}, np.zeros(3), np.array([1.,0,0]), np.array([0.,1,0]))
+            self.assertEqual(captured['entities'][0]['type'], kind)
+            plane = Feature.create('Plane','datum_plane',{})
+            sketch = Feature.create('Sketch','planar_sketch',captured,plane.id)
+            graph = FeatureGraph([plane,sketch])
+            self.assertEqual(len(graph.results[sketch.id].constraint_status.points),4)
+
+    def test_promoted_new_sketch_cancel_does_not_commit(self):
+        manager = ActionManager(None)
+        actor = Mock()
+        manager.plotter = SimpleNamespace(actors={}, remove_actor=Mock(), render=Mock(), disable_picking=Mock(),
+                                          add_mesh=Mock(return_value=actor))
+        manager.render_history_sketch = Mock()
+        manager.sketch_editing = manager.pending_sketch = True
+        manager.active_center=np.zeros(3); manager.active_normal=np.array([0.,0,1])
+        manager.u_axis=np.array([1.,0,0]); manager.v_axis=np.array([0.,1,0])
+        manager.activated_sketch_id=1
+        manager.sketchs_data[1]={'sketch_func':[SimpleNamespace(type='line', points=[np.array([0.,0,0]),np.array([2.,0,0])],
+            is_construction=False, render_obj={'points':[], 'lines':[]})]}
+        manager.promote_current_sketch()
+        self.assertIsNone(manager.parametric_graph)
+        self.assertIsNotNone(manager.history_edit_graph)
+        self.assertTrue(manager.cancel_history_sketch())
+        self.assertIsNone(manager.parametric_graph)
+        self.assertFalse(manager.sketch_editing)
+
+    def test_promote_render_failure_keeps_live_sketch(self):
+        manager = ActionManager(None)
+        manager.plotter = SimpleNamespace(actors={}, remove_actor=Mock(), render=Mock())
+        manager.render_history_sketch = Mock(side_effect=ValueError('render failed'))
+        manager.sketch_editing = manager.pending_sketch = True
+        manager.active_center=np.zeros(3); manager.active_normal=np.array([0.,0,1])
+        manager.u_axis=np.array([1.,0,0]); manager.v_axis=np.array([0.,1,0])
+        tool = SimpleNamespace(type='line', points=[np.array([0.,0,0]),np.array([2.,0,0])],
+                               is_construction=False, render_obj={'points':[], 'lines':[]})
+        manager.activated_sketch_id=1; manager.sketchs_data[1]={'sketch_func':[tool]}
+        with self.assertRaisesRegex(ValueError, 'render failed'): manager.promote_current_sketch()
+        self.assertIsNone(manager.history_edit_graph)
+        self.assertIsNone(manager.parametric_graph)
+        self.assertIs(manager.get_current_sketch_data()['sketch_func'][0],tool)
+        self.assertTrue(manager.sketch_editing)
+
+    def test_drawn_bezier_is_immediately_editable_in_scene_candidate(self):
+        manager = ActionManager(None)
+        manager.plotter = SimpleNamespace(actors={}, remove_actor=Mock(), render=Mock(), disable_picking=Mock(),
+            track_click_position=Mock(), add_points=Mock(side_effect=lambda *a,**k:Mock()), add_mesh=Mock(return_value=Mock()))
+        manager.render_history_sketch = Mock()
+        manager.sketch_editing = manager.pending_sketch = True
+        manager.active_center=np.zeros(3); manager.active_normal=np.array([0.,0,1])
+        manager.u_axis=np.array([1.,0,0]); manager.v_axis=np.array([0.,1,0])
+        manager.activated_sketch_id=1; manager.sketchs_data[1]={'sketch_func':[]}
+        manager.get_snapped_pos=lambda point:(np.asarray(point,dtype=float),np.asarray(point,dtype=float)[:2])
+        manager.activate_spline_mode('spline')
+        tool=manager.active_tool
+        for point in ([0,0,0],[1,0,0],[2,1,0],[3,1,0]): tool.on_click(point)
+        self.assertIsNone(manager.parametric_graph)
+        self.assertIsNotNone(manager.history_edit_id)
+        self.assertIsNone(manager.active_tool)
+        manager.move_history_point('SP1.P2', (1,.5))
+        np.testing.assert_allclose(manager.history_edit_graph.results[manager.history_edit_id].constraint_status.points['SP1.P2'],[1,.5],atol=1e-6)
+        self.assertIsNone(manager.parametric_graph)
+
+    def test_sketch_camera_style_rotates_only_with_control(self):
+        from UI.model.sketch_navigation import SketchCameraStyle
+        manager = SimpleNamespace(_finish_history_drag=Mock())
+        style = SketchCameraStyle(manager)
+        interactor = SimpleNamespace(GetControlKey=Mock(return_value=0), GetEventPosition=lambda:(20,30))
+        with patch.object(style, 'GetInteractor', return_value=interactor), \
+             patch.object(style, 'FindPokedRenderer') as find, \
+             patch.object(style, 'GetCurrentRenderer', return_value=object()), \
+             patch.object(style, 'StartRotate') as rotate, patch.object(style, 'EndRotate') as end:
+            style._press()
+            rotate.assert_not_called()
+            interactor.GetControlKey.return_value = 1
+            style._press()
+            find.assert_called_once_with(20,30)
+            rotate.assert_called_once()
+            style._release()
+            end.assert_called_once()
+            manager._finish_history_drag.assert_called_once()
+
+    def test_sketch_camera_style_restored(self):
+        manager = ActionManager(None)
+        original = object()
+        manager.plotter = SimpleNamespace(iren=SimpleNamespace(style=original))
+        manager.lock_sketch_camera()
+        self.assertIsNot(manager.plotter.iren.style, original)
+        manager.restore_camera_style()
+        self.assertIs(manager.plotter.iren.style, original)
+
+    def test_control_click_does_not_create_sketch_point(self):
+        from UI.model.tools.Line import Line
+        plotter = SimpleNamespace(track_click_position=Mock())
+        owner = SimpleNamespace(control_modifier_active=Mock(return_value=True))
+        tool = Line(plotter, {}, owner)
+        tool.on_click = Mock()
+        tool.track_sketch_click()
+        callback = plotter.track_click_position.call_args.kwargs['callback']
+        callback((1,2,3))
+        tool.on_click.assert_not_called()
+        owner.control_modifier_active.return_value = False
+        callback((1,2,3))
+        tool.on_click.assert_called_once_with((1,2,3))
+
+    def test_scene_point_hit_uses_pixel_distance(self):
+        manager, sketch, _ = self.scene_history_manager()
+        manager.history_edit_id, manager.history_edit_graph = sketch.id, manager.parametric_graph
+        manager.history_point_actors = {'a':Mock(), 'b':Mock()}
+        position = [0.,0.,0.,1.]
+        renderer = SimpleNamespace(SetWorldPoint=lambda *p: position.__setitem__(slice(None),p),
+                                   WorldToDisplay=lambda:None,
+                                   GetDisplayPoint=lambda:(position[0]*10,position[1]*10,.5))
+        manager.plotter.renderer = renderer
+        manager.plotter.iren = SimpleNamespace(get_event_position=lambda:(43,1))
+        self.assertEqual(manager._history_handle_at_cursor(), 'b')
+        manager.plotter.iren.get_event_position = lambda:(100,100)
+        self.assertIsNone(manager._history_handle_at_cursor())
+
+    def scene_history_manager(self, fixed=False):
+        plane = Feature.create('Plane','datum_plane',{})
+        constraints = [{'kind':'fixed','entities':['b'],'value':[4,0]}] if fixed else []
+        sketch = Feature.create('Sketch','planar_sketch', {'points':{'a':[0,0],'b':[4,0],'c':[4,4],'d':[0,4]},
+            'entities':[{'type':'line','points':['a','b','c','d','a']}], 'constraints':constraints}, plane.id)
+        solid = Feature.create('Extrude','extrude',{'distance':2},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        body = Mock(); actor = Mock(); actor.prop = SimpleNamespace(color=None, opacity=None)
+        manager = ActionManager(None)
+        manager.plotter = SimpleNamespace(actors={'main_part':body}, remove_actor=Mock(), disable_picking=Mock(),
+                                           add_mesh=Mock(return_value=actor), render=Mock())
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.parametric_graph = graph
+        manager.current_part = graph.results[solid.id]
+        manager.align_camera_to_normal = Mock()
+        manager.update_grid_lod = Mock()
+        manager.render_history_sketch = Mock()
+        return manager, sketch, solid
+
+    def test_scene_history_edit_cancel_commit_and_undo(self):
+        manager, sketch, solid = self.scene_history_manager()
+        manager.start_history_sketch(sketch.id)
+        manager.move_history_point('b', (6,0))
+        self.assertAlmostEqual(manager.history_edit_graph.results[solid.id].volume, 40, places=5)
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 32, places=5)
+        self.assertTrue(manager.cancel_history_sketch())
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 32, places=5)
+        manager.start_history_sketch(sketch.id)
+        manager.move_history_point('b', (6,0))
+        manager.finish_history_sketch()
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 40, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'scene_edit.fcad'
+            save_snapshot(filename, manager.current_part, [], [], feature_graph=manager.parametric_graph)
+            _, _, _, restored = load_snapshot(filename, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, 40, places=5)
+        self.assertTrue(manager.undo_solid())
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 32, places=5)
+
+    def test_scene_history_edit_rejects_constraint_conflict(self):
+        manager, sketch, solid = self.scene_history_manager(fixed=True)
+        manager.start_history_sketch(sketch.id)
+        before = manager.history_edit_graph.to_data()
+        with self.assertRaises(RebuildError): manager.move_history_point('b', (6,0))
+        self.assertEqual(manager.history_edit_graph.to_data(), before)
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 32, places=5)
+
+    def test_scene_history_point_drag_event_is_transactional(self):
+        manager, sketch, solid = self.scene_history_manager()
+        manager.start_history_sketch(sketch.id)
+        actor = Mock()
+        manager.history_point_actors = {'b':actor}
+        manager._history_handle_at_cursor = Mock(return_value='b')
+        manager.plotter.iren = SimpleNamespace(get_event_position=Mock(side_effect=[(10,10),(30,10)]),
+            interactor=Mock())
+        manager._screen_to_sketch_plane = Mock(return_value=np.array([6.,0.,0.]))
+        manager._begin_history_drag()
+        manager._finish_history_drag()
+        self.assertAlmostEqual(manager.history_edit_graph.results[solid.id].volume, 40, places=5)
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 32, places=5)
+
+    def test_scene_history_renders_circle_radius_handle(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch',{'points':{'c':[0,0]},
+            'entities':[{'type':'circle','center':'c','radius':2}]},plane.id)
+        solid = Feature.create('Extrude','extrude',{'distance':2},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        manager = ActionManager(None)
+        manager.plotter = SimpleNamespace(remove_actor=Mock(), add_mesh=Mock(side_effect=lambda *a,**k: Mock()),
+                                          add_points=Mock(side_effect=lambda *a,**k: Mock()), render=Mock())
+        manager.history_edit_id, manager.history_edit_graph = sketch.id, graph
+        manager.active_center = np.zeros(3); manager.u_axis=np.array([1.,0,0]); manager.v_axis=np.array([0.,1,0])
+        manager.render_history_sketch()
+        self.assertIn('c', manager.history_point_actors)
+        self.assertIn(('radius',0,'c'), manager.history_point_actors)
+
+    def test_scene_history_adds_geometry_without_replacing_original(self):
+        manager, sketch, solid = self.scene_history_manager()
+        manager.start_history_sketch(sketch.id)
+        tool = SimpleNamespace(type='line', points=[np.array([0.,0.,0.]),np.array([1.,1.,0.])],
+                               is_construction=True, is_drawing=False, render_obj={'points':[], 'lines':[]})
+        manager.get_current_sketch_data()['sketch_func'].append(tool)
+        manager.finish_history_sketch()
+        feature = next(item for item in manager.parametric_graph.features if item.id == sketch.id)
+        self.assertEqual(len(feature.parameters['entities']), 2)
+        self.assertEqual(feature.parameters['entities'][0]['points'], ['a','b','c','d','a'])
+        self.assertTrue(feature.parameters['entities'][1]['construction'])
+        self.assertTrue(any(item['kind'] == 'coincident' for item in feature.parameters['constraints']))
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume, 32, places=5)
+
+    def test_scene_spline_flush_constraints_cancel_and_persist(self):
+        manager, sketch, solid = self.scene_history_manager()
+        manager.start_history_sketch(sketch.id)
+        spline = SimpleNamespace(type='nurbs', points=[np.array([1.,1.,0.]),np.array([2.,1.,0.]),np.array([3.,2.,0.])],
+            degree=2, weights=[1.,1.,1.], knots=[0.,0.,0.,1.,1.,1.], is_construction=True,
+            render_obj={'points':[], 'lines':[]})
+        manager.get_current_sketch_data()['sketch_func'].append(spline)
+        manager.flush_history_tools()
+        self.assertEqual(len(manager.history_edit_graph.features[1].parameters['entities']),2)
+        self.assertEqual(len(manager.parametric_graph.features[1].parameters['entities']),1)
+        entity = manager.history_edit_graph.features[1].parameters['entities'][1]
+        point = entity['points'][0]
+        manager.history_edit_graph = add_sketch_constraint(manager.history_edit_graph,sketch.id,
+            {'kind':'fixed','entities':[point],'value':[1.,1.]})
+        manager.history_edit_graph = edit_nurbs_parameters(manager.history_edit_graph,sketch.id,1,2,
+            [1.,.7,1.],[0.,0.,0.,1.,1.,1.])
+        manager.finish_history_sketch()
+        saved = manager.parametric_graph.features[1].parameters
+        self.assertEqual(saved['entities'][1]['weights'], [1.,.7,1.])
+        self.assertTrue(any(c['kind']=='fixed' and c['entities']==[point] for c in saved['constraints']))
+        self.assertAlmostEqual(manager.parametric_graph.results[solid.id].volume,32,places=5)
+        self.assertTrue(manager.undo_solid())
+        self.assertEqual(len(manager.parametric_graph.features[1].parameters['entities']),1)
+
+    def test_capture_elliptical_arc_build_and_roundtrip(self):
+        from UI.model.sketch_capture import capture_sketch
+        origin = np.zeros(3); u = np.array([1.,0,0]); v = np.array([0.,1,0])
+        arc = SimpleNamespace(type='ellipse', center=origin, major_axis_vector=u, major_radius=4., minor_radius=2.,
+                              is_closed=False, start_angle=0., end_angle=math.pi/2,
+                              points=[origin, [4,0,0], [0,2,0], [4,0,0], [0,2,0]], is_construction=False)
+        line = SimpleNamespace(type='line', points=[np.array([0.,2.,0.]), origin, np.array([4.,0.,0.])], is_construction=False)
+        data = capture_sketch({'sketch_func':[arc,line]}, origin,u,v)
+        self.assertFalse(data['entities'][0]['is_closed'])
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch',data,plane.id)
+        solid = Feature.create('Extrude','extrude',{'distance':2},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        self.assertAlmostEqual(graph.results[solid.id].volume, 4*math.pi, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'ellipse_arc.fcad'
+            save_snapshot(filename, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(filename, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, 4*math.pi, places=5)
+
+    def test_legacy_migration_preserves_snapshot_undo_and_redo(self):
+        manager = ActionManager(None)
+        manager.plotter = SimpleNamespace(remove_actor=Mock())
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.current_part = Box(2,2,2)
+        manager.undo_stack = [None]
+        manager.timeline.append('Box', {'Size':'2'})
+        manager.convert_legacy_model()
+        self.assertEqual(manager.parametric_graph.features[0].kind, 'frozen_body')
+        self.assertAlmostEqual(manager.current_part.volume, 8)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'converted.fcad'
+            save_snapshot(filename, manager.current_part, [], [], feature_graph=manager.parametric_graph)
+            _, _, _, restored = load_snapshot(filename, include_feature_graph=True)
+            from UI.model.legacy_conversion import restore_snapshot
+            body, undo, redo, timeline = restore_snapshot(restored)
+            self.assertAlmostEqual(body.volume, 8)
+            self.assertEqual(undo, [None])
+            self.assertEqual(len(timeline['entries']), 1)
+        self.assertTrue(manager.undo_solid())
+        self.assertIsNone(manager.parametric_graph)
+        self.assertEqual(manager.undo_stack, [None])
+        self.assertTrue(manager.redo_solid())
+        self.assertEqual(manager.parametric_graph.features[0].kind, 'frozen_body')
+
+    def test_interactive_capture_preserves_axes_and_constraints(self):
+        from UI.model.sketch_capture import capture_sketch
+        origin = np.array([5., 2., 3.]); u = np.array([0., 1., 0.]); v = np.array([0., 0., 1.])
+        world = lambda x,y: origin + x*u + y*v
+        line = SimpleNamespace(type='line', points=[world(0,0), world(4,0)], is_construction=False)
+        circle = SimpleNamespace(type='circle', points=[world(2,2),world(3,2)], center=world(2,2), radius=1., is_construction=False)
+        data = capture_sketch({'sketch_func':[line,circle],
+                               'constraints':[Constraint('horizontal', (('L1.P1','L1.P2'),)),
+                                              Constraint('fixed', ('L1.P1',), (np.float64(0), np.float64(0)))]}, origin,u,v)
+        np.testing.assert_allclose(data['points']['L1.P2'], [4,0])
+        np.testing.assert_allclose(data['points']['C2.center'], [2,2])
+        plane = Feature.create('Plane','datum_plane',{'origin':origin.tolist(), 'normal':[1,0,0], 'x_dir':u.tolist()})
+        sketch = Feature.create('Sketch','planar_sketch',data,plane.id)
+        graph = FeatureGraph([plane,sketch])
+        self.assertEqual(len(graph.results[sketch.id].profiles), 1)
+        center = graph.results[sketch.id].profiles[0].center()
+        np.testing.assert_allclose(tuple(center), world(2,2), atol=1e-6)
+
+    def test_face_supported_sketch_and_join_rebuild(self):
+        box = Feature.create('Box','primitive',{'type':'box','dimensions':[4,4,4], 'operation':'new_body'})
+        initial = FeatureGraph([box])
+        body = initial.results[box.id]
+        face_index = next(i for i, face in enumerate(body.faces()) if tuple(face.normal_at())[2] > .9)
+        ref = make_reference(box.id, body, 'face', face_index)
+        plane = Feature.create('Plane','datum_plane',{'face':ref, 'x_dir':[1,0,0]},box.id)
+        sketch = Feature.create('Sketch','planar_sketch', {'points':{'c':[0,0]},
+            'entities':[{'type':'circle','center':'c','radius':1}]},plane.id)
+        extrude_feature = Feature.create('Extrude','extrude',{'distance':1,'operation':'join',
+            'base_id':box.id,'profile_index':0,'profile_count':1},sketch.id)
+        graph = FeatureGraph([box,plane,sketch,extrude_feature])
+        self.assertAlmostEqual(graph.results[extrude_feature.id].volume, 64+math.pi, places=5)
+        graph.edit(box.id, parameters={'type':'box','dimensions':[6,4,4], 'operation':'new_body'})
+        self.assertAlmostEqual(graph.results[extrude_feature.id].volume, 96+math.pi, places=5)
+
+    def test_interactive_sketch_capture_and_selected_profile_extrusion(self):
+        manager = ActionManager(None)
+        actors = {}
+        def add_mesh(mesh, **kwargs):
+            actor = Mock(); actor.prop = SimpleNamespace(color=None, opacity=None)
+            actors[kwargs['name']] = actor
+            return actor
+        manager.plotter = SimpleNamespace(actors=actors, add_mesh=add_mesh, remove_actor=Mock(),
+                                          disable_picking=Mock(), render=Mock())
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.active_center = np.array([0.,0.,0.]); manager.active_normal = np.array([0.,0.,1.])
+        manager.u_axis = np.array([1.,0.,0.]); manager.v_axis = np.array([0.,1.,0.])
+        def line(points):
+            return SimpleNamespace(type='line', points=[np.array([x,y,0.]) for x,y in points],
+                                   is_construction=False, render_obj={'points':[], 'lines':[]}, is_drawing=False)
+        manager.activated_sketch_id = 1
+        manager.sketchs_data[1] = {'sketch_func':[line([(0,0),(2,0),(2,2),(0,2),(0,0)]),
+                                                   line([(5,0),(8,0),(8,3),(5,3),(5,0)])]}
+        manager.sketch_editing = True
+        manager.exit_sketch_mode()
+        self.assertEqual(len(manager.profiles), 2)
+        sketch_id = manager.parametric_sketch_id
+        manager._pick_actor = Mock(return_value=SimpleNamespace(GetActor=lambda: actors[manager.profiles[1]['name']]))
+        self.assertTrue(manager._select_profile())
+        self.assertEqual(manager.selected_profile_index, 1)
+        selected_area = manager.profiles[1]['face'].area
+        feature_id = manager.commit_parametric_extrusion(1, 3)
+        self.assertAlmostEqual(manager.current_part.volume, selected_area*3, places=5)
+        feature = next(item for item in manager.parametric_graph.features if item.id == feature_id)
+        self.assertEqual(feature.input_id, sketch_id)
+        self.assertEqual(feature.parameters['profile_index'], 1)
+        self.assertEqual(feature.parameters['profile_count'], 2)
+        self.assertTrue(manager.undo_solid())
+        self.assertIsNone(manager.current_part)
+        self.assertEqual(len(manager.profiles), 2)
+        self.assertTrue(manager.redo_solid())
+        self.assertAlmostEqual(manager.current_part.volume, selected_area*3, places=5)
+        restored = FeatureGraph.from_data(manager.parametric_graph.to_data())
+        self.assertAlmostEqual(restored.results[feature_id].volume, selected_area*3, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'scene_extrude.fcad'
+            save_snapshot(path, manager.current_part, [], [], feature_graph=restored)
+            _, _, _, loaded = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(loaded.results[feature_id].volume, selected_area*3, places=5)
+        params = next(item for item in restored.features if item.id == sketch_id).parameters
+        params['points']['L2.P3'][1] = 4
+        params['points']['L2.P4'][1] = 4
+        restored.edit(sketch_id, parameters=params)
+        self.assertNotAlmostEqual(restored.results[feature_id].volume, selected_area*3, places=5)
+        manager.show_parametric_profiles(sketch_id)
+        second_area = manager.profiles[0]['face'].area
+        second = manager.commit_parametric_extrusion(0, 2, operation='new_body')
+        self.assertAlmostEqual(manager.parametric_graph.results[second].volume, selected_area*3 + second_area*2, places=5)
+        second_feature = next(item for item in manager.parametric_graph.features if item.id == second)
+        self.assertEqual(second_feature.parameters['base_id'], feature_id)
+
+    def test_extrusion_rejects_profile_count_change(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch', {'points':{'a':[0,0],'b':[2,0],'c':[2,2],'d':[0,2]},
+            'entities':[{'type':'line','points':['a','b','c','d','a']}]}, plane.id)
+        solid = Feature.create('Extrude','extrude',{'distance':3,'profile_index':0,'profile_count':1},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        changed = dict(sketch.parameters)
+        changed['points'] = dict(changed['points'], e=[1,-1], f=[1,3])
+        changed['entities'] = changed['entities'] + [{'type':'line','points':['e','f']}]
+        with self.assertRaisesRegex(RebuildError, 'topology changed'):
+            graph.edit(sketch.id, parameters=changed)
+        self.assertAlmostEqual(graph.results[solid.id].volume, 12)
+
+    def test_profile_identity_survives_unrelated_topology_change(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch', {'points':{'a':[0,0],'b':[5,0]},
+            'entities':[{'type':'circle','center':'a','radius':1}, {'type':'circle','center':'b','radius':2}]}, plane.id)
+        initial = FeatureGraph([plane,sketch])
+        result = initial.results[sketch.id]
+        selected = next(i for i, face in enumerate(result.profiles) if face.center().X > 3)
+        key = result.profile_keys[selected]
+        self.assertIsNotNone(key)
+        solid = Feature.create('Extrude','extrude',{'distance':3,'profile_index':selected,
+                                                     'profile_count':2,'profile_key':key},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        changed = dict(sketch.parameters)
+        changed['points'] = dict(changed['points'], c=[-5,0])
+        changed['entities'] = changed['entities'] + [{'type':'circle','center':'c','radius':.5}]
+        graph.edit(sketch.id, parameters=changed)
+        self.assertAlmostEqual(graph.results[solid.id].volume, 12*math.pi, places=5)
+        missing = dict(changed, entities=[changed['entities'][0], changed['entities'][2]])
+        with self.assertRaisesRegex(RebuildError, 'missing or ambiguous'):
+            graph.edit(sketch.id, parameters=missing)
+        self.assertAlmostEqual(graph.results[solid.id].volume, 12*math.pi, places=5)
+
+    def test_split_profile_reports_missing_identity(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch', {'points':{'c':[0,0]},
+            'entities':[{'type':'circle','center':'c','radius':2}]}, plane.id)
+        initial = FeatureGraph([plane,sketch])
+        key = initial.results[sketch.id].profile_keys[0]
+        self.assertIsNotNone(key)
+        solid = Feature.create('Extrude','extrude',{'distance':2,'profile_index':0,'profile_count':1,'profile_key':key},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        changed = dict(sketch.parameters)
+        changed['points'] = dict(changed['points'], a=[-3,0], b=[3,0])
+        changed['entities'] = changed['entities'] + [{'type':'line','points':['a','b']}]
+        with self.assertRaisesRegex(RebuildError, 'missing or ambiguous'):
+            graph.edit(sketch.id, parameters=changed)
+        self.assertAlmostEqual(graph.results[solid.id].volume, 8*math.pi, places=5)
+
+    def test_reselect_profile_after_suppressed_sketch_split(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch', {'points':{'c':[0,0]},
+            'entities':[{'type':'circle','center':'c','radius':2}]}, plane.id)
+        start = FeatureGraph([plane, sketch])
+        solid = Feature.create('Extrude','extrude',{'distance':2,'profile_index':0,'profile_count':1,
+            'profile_key':start.results[sketch.id].profile_keys[0]},sketch.id)
+        graph = FeatureGraph([plane,sketch,solid])
+        graph.edit(solid.id, suppressed=True)
+        changed = dict(sketch.parameters)
+        changed['points'] = dict(changed['points'], a=[-3,0], b=[3,0])
+        changed['entities'] = changed['entities'] + [{'type':'line','points':['a','b']}]
+        graph.edit(sketch.id, parameters=changed)
+        manager = ActionManager(None)
+        actor = Mock(); actor.prop = SimpleNamespace(color=None, opacity=None)
+        manager.plotter = SimpleNamespace(add_mesh=Mock(return_value=actor), remove_actor=Mock(), render=Mock())
+        manager.parametric_graph = graph
+        ui = SimpleNamespace(action_manager=manager, window=None)
+        LayoutManager.reselect_extrusion_profile(ui, solid.id)
+        self.assertEqual(len(manager.profiles), 2)
+        manager.profile_selection_callback(0)
+        chosen = next(item for item in manager.parametric_graph.features if item.id == solid.id)
+        self.assertTrue(chosen.suppressed)
+        self.assertEqual(chosen.parameters['profile_count'], 2)
+        resumed = FeatureGraph.from_data(manager.parametric_graph.to_data())
+        resumed.edit(solid.id, suppressed=False)
+        self.assertAlmostEqual(resumed.results[solid.id].volume, 4*math.pi, places=5)
+
     def test_install_and_edit_graph_keeps_valid_model(self):
         plane = Feature.create('Plane', 'datum_plane', {})
         sketch = Feature.create('Rectangle', 'rectangle_sketch', {'width': 'width', 'height': 2}, plane.id)
@@ -1501,6 +2001,583 @@ class ParametricSketchConstraintsTest(unittest.TestCase):
 
 
 class ParametricSketchDragTest(unittest.TestCase):
+    def test_general_curvature_circle_ellipse_and_conflict(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch',{
+            'points':{'c':[0,0]},
+            'entities':[{'type':'circle','center':'c','radius':2},
+                        {'type':'ellipse','center':'c','radius_x':2,'radius_y':2,'construction':True}]},plane.id)
+        solid = Feature.create('Extrude','extrude',{'distance':2},sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'contact':0})
+        relation = {'kind':'curvature_curves','entities':[['@curve',0],['@curve',1]],'value':['contact',0]}
+        updated = add_sketch_constraint(graph, sketch.id, relation)
+        self.assertLess(updated.results[sketch.id].constraint_status.residual, 1e-7)
+        with self.assertRaises(RebuildError): updated.set_parameters({'contact':.25})
+        self.assertAlmostEqual(updated.results[solid.id].volume, 8*math.pi, places=5)
+
+    def test_general_curvature_nurbs_and_arc(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch',{
+            'points':{'a':[1,0],'b':[1,1],'c':[0,1], 'm':[2**-.5,2**-.5]},
+            'entities':[{'type':'nurbs','points':['a','b','c'],'degree':2,'weights':[1,2**-.5,1],
+                         'knots':[0,0,0,1,1,1], 'construction':True},
+                        {'type':'arc','points':['a','c','m'], 'construction':True}]},plane.id)
+        graph = FeatureGraph([plane, sketch])
+        updated = add_sketch_constraint(graph, sketch.id, {'kind':'curvature_curves',
+            'entities':[['@curve',0],['@curve',1]], 'value':[.5,.5]})
+        self.assertLess(updated.results[sketch.id].constraint_status.residual, 1e-7)
+        restored = FeatureGraph.from_data(updated.to_data())
+        self.assertLess(restored.results[sketch.id].constraint_status.residual, 1e-7)
+
+    def test_nurbs_parameters_transactional_and_linked(self):
+        plane = Feature.create('Plane','datum_plane',{})
+        sketch = Feature.create('Sketch','planar_sketch',{
+            'points':{'a':[1,0],'b':[1,1],'c':[0,1],'o':[0,0]},
+            'entities':[{'type':'nurbs','points':['a','b','c'],'degree':2,'weights':[1,1,1],
+                         'knots':[0,0,0,1,1,1]}, {'type':'line','points':['c','o','a']}]},plane.id)
+        solid = Feature.create('Extrude','extrude',{'distance':2},sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'w':2**-.5})
+        updated = edit_nurbs_parameters(graph,sketch.id,0,2,[1,'w',1],[0,0,0,1,1,1])
+        self.assertAlmostEqual(updated.results[solid.id].volume, math.pi/2, places=5)
+        with self.assertRaises(RebuildError): edit_nurbs_parameters(updated,sketch.id,0,2,[1,-1,1],[0,0,0,1,1,1])
+        self.assertEqual(updated.features[1].parameters['entities'][0]['weights'], [1,'w',1])
+    def test_composite_slot_with_bezier_and_nurbs_path(self):
+        from UI.model.composite_slot import composite_contact, composite_slot_edges
+        import build123d as cad
+        points = {'z':[-2,0], 'a':[0,0], 'b':[1,0], 'c':[2,1], 'd':[3,2]}
+        for kind in ('spline', 'nurbs'):
+            source = {'type':kind, 'points':['a','b','c','d'], 'construction':True}
+            degree, knots, weights = 0, [], []
+            if kind == 'nurbs':
+                degree, knots, weights = 3, [0,0,0,0,1,1,1,1], [1,1,1,1]
+                source.update(degree=degree, knots=knots, weights=weights)
+            segments = [('line', [points['z'], points['a']], 0, [], []),
+                        (kind, [points[n] for n in 'abcd'], degree, knots, weights)]
+            edges = composite_slot_edges(segments, cad.Plane.XY, .2)
+            contact, _, _ = composite_contact(segments, .2, 'segment:1:left', .4)
+            vertex = cad.Vertex(float(contact[0]), float(contact[1]), 0)
+            self.assertLess(min(vertex.distance_to(edge) for edge in edges), 1e-5)
+            plane = Feature.create('Plane', 'datum_plane', {})
+            sketch = Feature.create('Sketch', 'planar_sketch', {'points':points,
+                'entities':[{'type':'line','points':['z','a'],'construction':True}, source,
+                            {'type':'composite_path_slot','curves':[0,1],'radius':.2}]}, plane.id)
+            solid = Feature.create('Extrude', 'extrude', {'distance':2}, sketch.id)
+            self.assertGreater(FeatureGraph([plane, sketch, solid]).results[solid.id].volume, 0)
+
+    def test_composite_curve_slot_rebuild_constraint_and_save(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        points = {'a':[0,0], 'b':[2,0], 'c':[4,2], 'd':[4,4],
+                  'm':[2+2**.5, 2-2**.5],
+                  's0':[1,.25], 's1':[2,.25], 's2':[3,.25], 's3':[4,.25]}
+        entities = [{'type':'line', 'points':['a','b'], 'construction':True},
+                    {'type':'arc', 'points':['b','c','m'], 'construction':True},
+                    {'type':'line', 'points':['c','d'], 'construction':True},
+                    {'type':'composite_path_slot', 'curves':[0,1,2], 'radius':'r'},
+                    {'type':'spline', 'points':['s0','s1','s2','s3'], 'construction':True}]
+        sketch = Feature.create('Sketch', 'planar_sketch', {'points':points, 'entities':entities,
+            'constraints':[{'kind':'curvature_spline_slot',
+                'entities':[['s0','s1','s2','s3'],'s0',['@composite_path_slot',3],'segment:0:left'], 'value':.5}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance':2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'r':.25})
+        self.assertAlmostEqual(graph.results[solid.id].volume, 2*(.5*(4+math.pi) + math.pi*.25**2), places=5)
+        self.assertLess(graph.results[sketch.id].constraint_status.residual, 1e-7)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'composite.fcad'
+            save_snapshot(filename, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(filename, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, graph.results[solid.id].volume, places=5)
+        original = graph.results[solid.id].volume
+        updated = move_sketch_point(graph, sketch.id, 'd', (5, 4))
+        self.assertNotAlmostEqual(updated.results[solid.id].volume, original, places=5)
+        self.assertAlmostEqual(graph.results[solid.id].volume, original, places=5)
+
+    def test_composite_slot_curvature_joint_is_not_smooth(self):
+        from UI.model.composite_slot import composite_contact
+        segments = [('line', [[0,0],[2,0]], 0, [], []),
+                    ('arc', [[2,0],[4,2],[2+2**.5,2-2**.5]], 0, [], [])]
+        left = composite_contact(segments, .25, 'segment:0:left', 1)
+        right = composite_contact(segments, .25, 'segment:1:left', 0)
+        np.testing.assert_allclose(left[0], right[0], atol=1e-8)
+        np.testing.assert_allclose(left[1], right[1], atol=1e-8)
+        self.assertGreater(np.linalg.norm(left[2]-right[2]), .1)
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a':[0,0], 'b':[2,0], 'c':[4,2], 'm':[2+2**.5,2-2**.5],
+                       's0':[2,.25], 's1':[3,.25], 's2':[4,.25], 's3':[5,.25]},
+            'entities': [{'type':'line','points':['a','b'],'construction':True},
+                         {'type':'arc','points':['b','c','m'],'construction':True},
+                         {'type':'composite_path_slot','curves':[0,1],'radius':.25},
+                         {'type':'spline','points':['s0','s1','s2','s3'],'construction':True}]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        with self.assertRaisesRegex(RebuildError, 'Curvature is discontinuous'):
+            add_sketch_constraint(graph, sketch.id, {'kind':'curvature_spline_slot',
+                'entities':[['s0','s1','s2','s3'],'s0',['@composite_path_slot',2],'segment:0:left'], 'value':1})
+
+    def test_point_at_composite_slot_parameter(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        points = {'a':[0,0], 'b':[2,0], 'c':[4,2], 'm':[2+2**.5,2-2**.5], 'p':[1,2]}
+        sketch = Feature.create('Sketch', 'planar_sketch', {'points':points,
+            'entities':[{'type':'line','points':['a','b'],'construction':True},
+                        {'type':'arc','points':['b','c','m'],'construction':True},
+                        {'type':'composite_path_slot','curves':[0,1],'radius':.25}],
+            'constraints':[{'kind':'fixed','entities':[name],'value':points[name]} for name in ('a','b','c','m')] +
+                          [{'kind':'point_on_slot','entities':['p',['@composite_path_slot',2],'segment:0:left'],'value':.5}]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        np.testing.assert_allclose(graph.results[sketch.id].constraint_status.points['p'], [1,.25], atol=1e-6)
+    def test_periodic_nurbs_repeated_knots(self):
+        from UI.model.nurbs import periodic_nurbs_contact, periodic_nurbs_edge
+        points = [[2,0], [1,2], [-1,2], [-2,0], [-1,-2], [1,-2]]
+        spans = [1, 0, 1, 1, 1, 1]
+        weights = [1] * len(points)
+        left = periodic_nurbs_contact(points, 3, weights, 0, spans)
+        right = periodic_nurbs_contact(points, 3, weights, 1, spans)
+        for a, b in zip(left, right): np.testing.assert_allclose(a, b, atol=1e-8)
+        self.assertTrue(periodic_nurbs_edge([(*p,0) for p in points], 3, weights, spans).is_closed)
+        seam_spans = [1, 1, 1, 1, 1, 0]
+        left = periodic_nurbs_contact(points, 3, weights, 0, seam_spans)
+        right = periodic_nurbs_contact(points, 3, weights, 1, seam_spans)
+        for a, b in zip(left, right): np.testing.assert_allclose(a, b, atol=1e-8)
+        with self.assertRaises(ValueError):
+            periodic_nurbs_edge([(*p,0) for p in points], 3, weights, [1,0,0,0,1,1])
+
+    def test_point_at_spline_parameter_rebuilds_and_rejects_invalid_parameter(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        points = {'a':[0,0], 'b':[2,0], 'c':[3,1], 'd':[4,2], 'p':[1,3]}
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points':points,
+            'entities':[{'type':'fit_spline', 'points':['a','b','c','d'], 'construction':True}],
+            'constraints':[{'kind':'fixed', 'entities':[name], 'value':points[name]} for name in 'abcd'] +
+                          [{'kind':'point_on_spline', 'entities':['p',['@fit','a','b','c','d']], 'value':'t'}]}, plane.id)
+        graph = FeatureGraph([plane, sketch], {'t':.5})
+        from UI.model.spline_slot import spline_path_contact
+        solved = graph.results[sketch.id].constraint_status.points
+        target = spline_path_contact([solved[n] for n in 'abcd'], .5, 'fit_spline')[0]
+        np.testing.assert_allclose(solved['p'], target, atol=1e-6)
+        with self.assertRaises(RebuildError): graph.set_parameters({'t':1.2})
+
+    def test_slot_for_fit_and_nurbs_curves(self):
+        from UI.model.spline_slot import spline_slot_edges, spline_slot_contact
+        import build123d as cad
+        points = [[0,0],[2,0],[3,1],[4,2]]
+        paths = [('fit_spline', None, [], []), ('nurbs', 3, [0,0,0,0,1,1,1,1], [1,1,1,1])]
+        for kind, degree, knots, weights in paths:
+            edges = spline_slot_edges([(*p,0) for p in points], .25, kind, degree, knots, weights)
+            contact, _, _ = spline_slot_contact(points, .25, 'left', .4, kind, degree, knots, weights)
+            vertex = cad.Vertex(float(contact[0]), float(contact[1]), 0)
+            self.assertLess(min(vertex.distance_to(edge) for edge in edges), 1e-5, kind)
+            plane = Feature.create('Plane', 'datum_plane', {})
+            source = {'type': kind, 'points': list('abcd'), 'construction': True}
+            if kind == 'nurbs': source.update(degree=degree, knots=knots, weights=weights)
+            sketch = Feature.create('Sketch', 'planar_sketch', {'points': dict(zip('abcd', points)),
+                'entities': [source, {'type':'spline_slot', 'curve':0, 'radius':.25}]}, plane.id)
+            solid = Feature.create('Extrude', 'extrude', {'distance':2}, sketch.id)
+            graph = FeatureGraph([plane, sketch, solid])
+            self.assertGreater(graph.results[solid.id].volume, 0)
+            restored = FeatureGraph.from_data(graph.to_data())
+            self.assertAlmostEqual(restored.results[solid.id].volume, graph.results[solid.id].volume, places=5)
+    def test_nonuniform_periodic_nurbs_rebuild_and_round_trip(self):
+        from UI.model.nurbs import periodic_nurbs_contact, periodic_nurbs_edge
+        control = [[1,0], [0,1], [-1,0], [0,-1]]
+        weights, spans = [1,2,1,1], [1,2,3,4]
+        a = periodic_nurbs_contact(control, 2, weights, 0, spans)
+        b = periodic_nurbs_contact(control, 2, weights, 1, spans)
+        np.testing.assert_allclose(a[0], b[0], atol=1e-10)
+        np.testing.assert_allclose(a[1], b[1], atol=1e-10)
+        self.assertTrue(periodic_nurbs_edge([(*p, 0) for p in control], 2, weights, spans).is_closed)
+        with self.assertRaises(ValueError): periodic_nurbs_contact(control, 2, weights, .5, [1, 0, 0, 1])
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': dict(zip('abcd', control)),
+            'entities': [{'type': 'periodic_nurbs', 'points': list('abcd'), 'degree': 2,
+                          'weights': weights, 'spans': [1, 'span', 3, 4]}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'span': 2})
+        old = graph.results[solid.id].volume
+        graph.set_parameters({'span': 1})
+        self.assertNotAlmostEqual(old, graph.results[solid.id].volume, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nonuniform.fcad'
+            save_snapshot(path, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, graph.results[solid.id].volume, places=5)
+
+    def test_spline_slot_boundary_constraint_and_rebuild(self):
+        from UI.model.spline_slot import spline_slot_edges, spline_slot_contact
+        import build123d as cad
+        path = [[0,0], [2,0], [3,1], [4,2]]
+        edges = spline_slot_edges([(*p, 0) for p in path], .5)
+        contact, tangent, curvature = spline_slot_contact(path, .5, 'left', .4)
+        vertex = cad.Vertex(float(contact[0]), float(contact[1]), 0)
+        self.assertLess(min(vertex.distance_to(edge) for edge in edges), 1e-5)
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': dict(zip('abcd', path)),
+            'entities': [{'type': 'spline', 'points': list('abcd'), 'construction': True},
+                         {'type': 'spline_slot', 'curve': 0, 'radius': 'r'}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'r': .5})
+        old = graph.results[solid.id].volume
+        graph.set_parameters({'r': .4})
+        self.assertLess(graph.results[solid.id].volume, old)
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / 'spline_slot.fcad'
+            save_snapshot(filename, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(filename, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, graph.results[solid.id].volume, places=5)
+
+    def test_spline_slot_curvature_constraint_on_cap(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a':[0,0], 'b':[2,0], 'c':[3,1], 'd':[4,2],
+                       'x':[-.5,0], 'y':[0,.5], 'z':[-.5 * 2**-.5,.5 * 2**-.5]},
+            'entities': [{'type':'spline', 'points':['a','b','c','d'], 'construction':True},
+                         {'type':'spline_slot', 'curve':0, 'radius':.5},
+                         {'type':'arc', 'points':['x','y','z'], 'construction':True}],
+            'constraints': [{'kind':'curvature_arc_slot',
+                             'entities':[['x','y','z'],'x',['@spline_slot',1],'start_cap'], 'value':.5}]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        self.assertLess(graph.results[sketch.id].constraint_status.residual, 1e-7)
+
+    def test_periodic_nurbs_closed_curvature_and_save(self):
+        from UI.model.nurbs import periodic_nurbs_contact, periodic_nurbs_edge
+        control = [[1, 0], [0, 1], [-1, 0], [0, -1]]
+        start = periodic_nurbs_contact(control, 2, [1]*4, 0)
+        end = periodic_nurbs_contact(control, 2, [1]*4, 1)
+        for a, b in zip(start, end): np.testing.assert_allclose(a, b, atol=1e-10)
+        self.assertTrue(periodic_nurbs_edge([(*p, 0) for p in control], 2, [1]*4).is_closed)
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [1,0], 'b': [0,1], 'c': [-1,0], 'd': [0,-1],
+                       's0': [.5,.5], 's1': [-.5,1.5], 's2': [-3,1], 's3': [-3,0]},
+            'entities': [{'type': 'periodic_nurbs', 'points': ['a','b','c','d'], 'degree': 2, 'weights': [1,1,1,1]},
+                         {'type': 'spline', 'points': ['s0','s1','s2','s3'], 'construction': True}],
+            'constraints': [{'kind': 'curvature_spline_periodic_nurbs',
+                             'entities': [['s0','s1','s2','s3'], 's0', ['@periodic_nurbs', 0]], 'value': 0}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid])
+        self.assertLess(graph.results[sketch.id].constraint_status.residual, 1e-7)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'periodic.fcad'
+            save_snapshot(path, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, graph.results[solid.id].volume, places=5)
+
+    def test_arc_slot_profile_constraint_and_round_trip(self):
+        from UI.model.arc_slot import arc_slot_contact
+        plane = Feature.create('Plane', 'datum_plane', {})
+        points = {'a': [5, 0], 'b': [0, 5], 'm': [5 * 2**-.5, 5 * 2**-.5],
+                  's0': [6, 0], 's1': [6, 1], 's2': [5.75, 2], 's3': [5, 3]}
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': points,
+            'entities': [{'type': 'arc_slot', 'points': ['a', 'b', 'm'], 'radius': 'width'},
+                         {'type': 'spline', 'points': ['s0', 's1', 's2', 's3'], 'construction': True}],
+            'constraints': [{'kind': 'curvature_spline_slot',
+                'entities': [['s0', 's1', 's2', 's3'], 's0', ['@arc_slot', 0], 'outer'], 'value': 0}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'width': 1})
+        self.assertAlmostEqual(graph.results[solid.id].volume, 12 * math.pi, places=5)
+        contact, _, curvature = arc_slot_contact([points['a'], points['b'], points['m']], 1, 'outer', 0)
+        np.testing.assert_allclose(contact, [6, 0], atol=1e-8)
+        np.testing.assert_allclose(curvature, [-1/6, 0], atol=1e-8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'arc_slot.fcad'
+            save_snapshot(path, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, 12 * math.pi, places=5)
+        with self.assertRaises(RebuildError):
+            graph.set_parameters({'width': 5})
+
+    def test_arc_slot_clockwise_and_invalid_radius(self):
+        from UI.model.arc_slot import arc_slot_edges, arc_slot_contact
+        import build123d as cad
+        points = [(5, 0, 0), (0, -5, 0), (5 * 2**-.5, -5 * 2**-.5, 0)]
+        edges = arc_slot_edges(points, (0, 0, 1), 1)
+        self.assertAlmostEqual(cad.Face(cad.Wire.combine(edges)[0]).area, 6 * math.pi, places=5)
+        p, _, _ = arc_slot_contact([point[:2] for point in points], 1, 'outer', .5)
+        np.testing.assert_allclose(p, [6 * 2**-.5, -6 * 2**-.5], atol=1e-7)
+        with self.assertRaises(ValueError):
+            arc_slot_edges(points, (0, 0, 1), 5)
+
+    def test_polyline_slot_rebuild_and_round_trip(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [0, 0], 'b': [4, 0], 'c': [4, 3]},
+            'entities': [{'type': 'polyline_slot', 'points': ['a', 'b', 'c'], 'radius': 'width / 2'}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'width': 2})
+        self.assertAlmostEqual(graph.results[solid.id].volume, 2 * (13 + 5 * math.pi / 4), places=5)
+        updated = move_sketch_point(graph, sketch.id, 'c', (4, 4))
+        self.assertGreater(updated.results[solid.id].volume, graph.results[solid.id].volume)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'slot.fcad'
+            save_snapshot(path, updated.results[solid.id], [], [], feature_graph=updated)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, updated.results[solid.id].volume, places=5)
+        with self.assertRaises(RebuildError):
+            move_sketch_point(graph, sketch.id, 'c', (4, 0))
+
+    def test_polyline_slot_contact_rejects_hidden_component(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        points = {'a': [0, 0], 'b': [4, 0], 'c': [4, 3],
+                  's0': [2, 1], 's1': [3, 1], 's2': [4, 1], 's3': [5, 1]}
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': points,
+            'entities': [{'type': 'polyline_slot', 'points': ['a', 'b', 'c'], 'radius': 1},
+                         {'type': 'spline', 'points': ['s0', 's1', 's2', 's3'], 'construction': True}],
+            'constraints': [{'kind': 'fixed', 'entities': [name], 'value': value} for name, value in points.items()]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        relation = {'kind': 'curvature_spline_slot',
+                    'entities': [['s0', 's1', 's2', 's3'], 's0', ['@polyline_slot', 0], 'segment:0:left'], 'value': .5}
+        updated = add_sketch_constraint(graph, sketch.id, relation)
+        self.assertLess(updated.results[sketch.id].constraint_status.residual, 1e-7)
+        points2 = dict(points, s0=[4, 1], s1=[5, 1], s2=[6, 1], s3=[7, 1])
+        parameters = dict(sketch.parameters, points=points2,
+                          constraints=[{'kind': 'fixed', 'entities': [name], 'value': value} for name, value in points2.items()])
+        fixed_graph = FeatureGraph([plane, Feature(sketch.id, sketch.name, sketch.kind, parameters, plane.id)])
+        relation['value'] = 1
+        with self.assertRaisesRegex(RebuildError, 'hidden'):
+            add_sketch_constraint(fixed_graph, sketch.id, relation)
+    def test_nurbs_quarter_circle_matches_kernel_and_rebuilds(self):
+        from UI.model.nurbs import nurbs_contact, nurbs_edge
+        points = [[1., 0., 0.], [1., 1., 0.], [0., 1., 0.]]
+        weights, knots = [1., 2**-.5, 1.], [0., 0., 0., 1., 1., 1.]
+        position, tangent, curvature = nurbs_contact(points, 2, knots, weights, .5)
+        np.testing.assert_allclose(position, [2**-.5, 2**-.5, 0], atol=1e-10)
+        np.testing.assert_allclose(curvature, -position, atol=1e-10)
+        edge = nurbs_edge(points, 2, knots, weights)
+        np.testing.assert_allclose(tuple(edge.position_at(.5)), position, atol=1e-6)
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [1, 0], 'b': [1, 1], 'c': [0, 1], 'o': [0, 0]},
+            'entities': [{'type': 'nurbs', 'points': ['a', 'b', 'c'], 'degree': 2,
+                          'weights': [1, 'weight', 1], 'knots': knots},
+                         {'type': 'line', 'points': ['c', 'o', 'a']}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'weight': 2**-.5})
+        self.assertAlmostEqual(graph.results[solid.id].volume, math.pi / 2, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nurbs.fcad'
+            save_snapshot(path, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, math.pi / 2, places=5)
+            restored.set_parameters({'weight': 1})
+            self.assertNotAlmostEqual(restored.results[solid.id].volume, math.pi / 2, places=4)
+
+    def test_nurbs_curvature_constraint_with_circle(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [1, 0], 'b': [1, 1], 'c': [0, 1], 'o': [0, 0]},
+            'entities': [{'type': 'nurbs', 'points': ['a', 'b', 'c'], 'degree': 2,
+                          'weights': [1, 2**-.5, 1], 'knots': [0, 0, 0, 1, 1, 1], 'construction': True},
+                         {'type': 'circle', 'center': 'o', 'radius': 1}],
+            'constraints': [{'kind': 'curvature_spline_circle', 'entities': [['@nurbs', 0], 'a', ['o', '@circle:1']], 'value': 0}]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        self.assertLess(graph.results[sketch.id].constraint_status.residual, 1e-7)
+
+    def test_nurbs_rejects_invalid_knots_and_weights(self):
+        from UI.model.nurbs import nurbs_data
+        points = [[0, 0], [1, 1], [2, 0]]
+        with self.assertRaises(ValueError):
+            nurbs_data(points, 2, [0, 0, 0, 1, 1, 1], [1, 0, 1])
+        with self.assertRaises(ValueError):
+            nurbs_data(points, 2, [0, 0, .2, 1, 1, 1], [1, 1, 1])
+    def test_fit_spline_profile_drag_and_round_trip(self):
+        from UI.model.constraints import fit_spline
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [-2, 0], 'b': [-1, 2], 'c': [1, 2], 'd': [2, 0]},
+            'entities': [{'type': 'fit_spline', 'points': ['a', 'b', 'c', 'd']},
+                         {'type': 'line', 'points': ['d', 'a']}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid])
+        curve = fit_spline([graph.results[sketch.id].constraint_status.points[n] for n in ('a', 'b', 'c', 'd')])
+        np.testing.assert_allclose(curve(1), [-1, 2], atol=1e-10)
+        updated = move_sketch_point(graph, sketch.id, 'b', (-1, 3))
+        self.assertNotAlmostEqual(graph.results[solid.id].volume, updated.results[solid.id].volume)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fit.fcad'
+            save_snapshot(path, updated.results[solid.id], [], [], feature_graph=updated)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, updated.results[solid.id].volume, places=5)
+
+    def test_fit_spline_curvature_relation_on_slot(self):
+        points = {'a': [0., 0.], 'b': [4., 0.], 'w': [0., 1.],
+                  's0': [2., 1.], 's1': [3., 1.], 's2': [4., 1.], 's3': [5., 1.]}
+        fixed = [Constraint('fixed', (name,), value) for name, value in points.items()]
+        relation = Constraint('curvature_spline_slot',
+            (('@fit', 's0', 's1', 's2', 's3'), 's0', ('a', 'b', 'w'), 'left'), .5)
+        result = solve_constraints(points, {}, fixed + [relation])
+        self.assertNotEqual(result.status, 'conflict')
+        self.assertLess(result.residual, 1e-7)
+
+    def test_point_on_segment_and_circle(self):
+        points = {'a': [0., 0.], 'b': [4., 0.], 'p': [2., .3], 'c': [2., 1.]}
+        fixed = [Constraint('fixed', (name,), points[name]) for name in ('a', 'b', 'c')]
+        constraints = fixed + [Constraint('radius', (('c', 'r'),), 1),
+                               Constraint('point_on_line', ('p', ('a', 'b'))),
+                               Constraint('point_on_circle', ('p', ('c', 'r')))]
+        result = solve_constraints(points, {'r': 1}, constraints)
+        self.assertNotEqual(result.status, 'conflict')
+        np.testing.assert_allclose(result.points['p'], [2, 0], atol=1e-6)
+        bad = fixed + [Constraint('fixed', ('p',), [6, 0]), Constraint('point_on_line', ('p', ('a', 'b')))]
+        self.assertEqual(solve_constraints(points, {'r': 1}, bad).status, 'conflict')
+    def test_cubic_spline_closed_profile_rebuild_and_save(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [-2, 0], 'b': [-2, 2], 'c': [2, 2], 'd': [2, 0]},
+            'entities': [{'type': 'spline', 'points': ['a', 'b', 'c', 'd']},
+                         {'type': 'line', 'points': ['d', 'a']}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid])
+        changed = move_sketch_point(graph, sketch.id, 'b', (-2, 3))
+        self.assertNotAlmostEqual(graph.results[solid.id].volume, changed.results[solid.id].volume)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'spline.fcad'
+            save_snapshot(path, changed.results[solid.id], [], [], feature_graph=changed)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, changed.results[solid.id].volume, places=5)
+
+    def test_spline_curvature_on_slot_side_and_cap(self):
+        from UI.model.constraints import spline_endpoint, slot_contact
+        slot = [[0, 0], [4, 0], [0, 1]]
+        point, tangent, curvature = slot_contact(slot, 'end_cap', 0.5)
+        np.testing.assert_allclose(point, [5, 0], atol=1e-8)
+        np.testing.assert_allclose(curvature, [-1, 0], atol=1e-8)
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [0, 0], 'b': [4, 0], 'w': [0, 1],
+                       's0': [2, 1], 's1': [3, 1], 's2': [4, 1], 's3': [5, 2]},
+            'entities': [{'type': 'slot', 'points': ['a', 'b', 'w']},
+                         {'type': 'spline', 'points': ['s0', 's1', 's2', 's3'], 'construction': True}],
+            'constraints': [{'kind': 'curvature_spline_slot',
+                             'entities': [['s0', 's1', 's2', 's3'], 's0', ['a', 'b', 'w'], 'left'],
+                             'value': 'contact'}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'contact': .5})
+        state = graph.results[sketch.id].constraint_status
+        p, t, k = spline_endpoint([state.points[n] for n in ('s0', 's1', 's2', 's3')], 0)
+        sp, st, sk = slot_contact([state.points[n] for n in ('a', 'b', 'w')], 'left', .5)
+        np.testing.assert_allclose(p, sp, atol=1e-6)
+        np.testing.assert_allclose(k, sk, atol=1e-6)
+        graph.set_parameters({'contact': .25})
+        self.assertNotEqual(graph.results[sketch.id].constraint_status.status, 'conflict')
+
+    def test_spline_curvature_matches_arc_circle_and_ellipse(self):
+        points = {'s0': [1., 0.], 's1': [1., 1/3], 's2': [5/6, 2/3], 's3': [0., 1.],
+                  'a': [0., 1.], 'b': [1., 0.], 'm': [2**-.5, 2**-.5], 'c': [0., 0.]}
+        fixed = [Constraint('fixed', (name,), value) for name, value in points.items()]
+        fixed.append(Constraint('radius', (('c', 'r'),), 1))
+        for relation in [Constraint('curvature_spline_arc', (('s0', 's1', 's2', 's3'), 's0', ('a', 'b', 'm'), 'b')),
+                         Constraint('curvature_spline_circle', (('s0', 's1', 's2', 's3'), 's0', ('c', 'r')), 0),
+                         Constraint('curvature_spline_ellipse', (('s0', 's1', 's2', 's3'), 's0', 'c'), (1, 1, 0, 0))]:
+            result = solve_constraints(points, {'r': 1}, fixed + [relation])
+            self.assertNotEqual(result.status, 'conflict', relation.kind)
+            self.assertLess(result.residual, 1e-7)
+
+    def test_arc_slot_curvature_uses_actual_component(self):
+        points = {'a': [4., 0.], 'b': [5., 0.], 'w': [4., 1.],
+                  'p': [5., 1.], 'q': [6., 0.], 'm': [5. + 2**-.5, 2**-.5]}
+        fixed = [Constraint('fixed', (name,), value) for name, value in points.items()]
+        relation = Constraint('curvature_arc_slot', (('p', 'q', 'm'), 'q', ('a', 'b', 'w'), 'end_cap'), .5)
+        result = solve_constraints(points, {}, fixed + [relation])
+        self.assertNotEqual(result.status, 'conflict')
+        self.assertLess(result.residual, 1e-7)
+        bad = Constraint('curvature_arc_slot', (('p', 'q', 'm'), 'q', ('a', 'b', 'w'), 'start_cap'), .5)
+        self.assertEqual(solve_constraints(points, {}, fixed + [bad]).status, 'conflict')
+    def test_arc_ellipse_curvature_tracks_parameters_and_save(self):
+        from UI.model.constraints import arc_center_radius, ellipse_contact
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [2, 0], 'b': [4, 0], 'm': [3, 1], 'center': [0, 0]},
+            'entities': [{'type': 'arc', 'points': ['a', 'b', 'm'], 'construction': True},
+                         {'type': 'ellipse', 'center': 'center', 'radius_x': 'width', 'radius_y': 2}],
+            'constraints': [{'kind': 'fixed', 'entities': ['center'], 'value': [0, 0]},
+                            {'kind': 'curvature_arc_ellipse', 'entities': [['a', 'b', 'm'], 'b', 1], 'value': 0}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'width': 4})
+        graph.set_parameters({'width': 5})
+        state = graph.results[sketch.id].constraint_status
+        center, radius = arc_center_radius(*(state.points[n] for n in ('a', 'b', 'm')))
+        contact, tangent, curvature = ellipse_contact(state.points['center'], 5, 2, 0, 0)
+        np.testing.assert_allclose(state.points['b'], contact, atol=1e-6)
+        np.testing.assert_allclose((center - contact) / radius**2, curvature, atol=1e-6)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ellipse.fcad'
+            save_snapshot(path, graph.results[solid.id], [], [], feature_graph=graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, graph.results[solid.id].volume, places=5)
+
+    def test_ellipse_contact_curvature_on_rotated_ellipse(self):
+        from UI.model.constraints import ellipse_contact
+        point, tangent, curvature = ellipse_contact([1, 2], 4, 2, 90, 0)
+        np.testing.assert_allclose(point, [1, 6], atol=1e-10)
+        np.testing.assert_allclose(tangent, [-1, 0], atol=1e-10)
+        np.testing.assert_allclose(curvature, [0, -1], atol=1e-10)
+
+    def test_concentric_arc_circle_and_equal_radius(self):
+        points = {'a': [-2., 0.], 'b': [2., 0.], 'm': [0., 2.], 'c': [1., 1.]}
+        constraints = [Constraint('fixed', (name,), points[name]) for name in ('a', 'b', 'm')]
+        constraints += [Constraint('concentric_arc_circle', (('a', 'b', 'm'), ('c', 'r'))),
+                        Constraint('equal_radius_arc_circle', (('a', 'b', 'm'), ('c', 'r')))]
+        result = solve_constraints(points, {'r': 1.}, constraints)
+        self.assertNotEqual(result.status, 'conflict')
+        np.testing.assert_allclose(result.points['c'], [0, 0], atol=1e-6)
+        self.assertAlmostEqual(result.radii['r'], 2, places=6)
+
+    def test_arc_radius_drives_extrusion_and_round_trips(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [-2, 0], 'b': [2, 0], 'm': [0, 2]},
+            'entities': [{'type': 'arc', 'points': ['a', 'b', 'm']},
+                         {'type': 'line', 'points': ['b', 'a']}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 2}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'arc_r': 3})
+        updated = add_sketch_constraint(graph, sketch.id, {
+            'kind': 'arc_radius', 'entities': [['a', 'b', 'm']], 'value': 'arc_r'})
+        from UI.model.constraints import arc_center_radius
+        state = updated.results[sketch.id].constraint_status
+        self.assertAlmostEqual(arc_center_radius(*(state.points[n] for n in ('a', 'b', 'm')))[1], 3, places=6)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'arc.fcad'
+            save_snapshot(path, updated.results[solid.id], [], [], feature_graph=updated)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            self.assertAlmostEqual(restored.results[solid.id].volume, updated.results[solid.id].volume, places=5)
+
+    def test_arc_tangent_and_curvature_geometry(self):
+        points = {'a': [-1., 0.], 'b': [0., 1.], 'm': [-2**-.5, 2**-.5],
+                  'c': [0., 1.], 'd': [1., 0.], 'n': [2**-.5, 2**-.5],
+                  'l1': [-2., 1.], 'l2': [2., 1.]}
+        constraints = [Constraint('fixed', (name,), value) for name, value in points.items()]
+        constraints += [Constraint('tangent_line_arc', (('l1', 'l2'), ('a', 'b', 'm'), 'b')),
+                        Constraint('tangent_arc_arc', (('a', 'b', 'm'), 'b', ('c', 'd', 'n'), 'c')),
+                        Constraint('curvature_arc_arc', (('a', 'b', 'm'), 'b', ('c', 'd', 'n'), 'c'))]
+        solved = solve_constraints(points, {}, constraints)
+        self.assertNotEqual(solved.status, 'conflict')
+        self.assertLess(solved.residual, 1e-7)
+        shifted = dict(points, n=[0.8, 0.8])
+        conflicting = [Constraint('fixed', (name,), value) for name, value in shifted.items()]
+        conflicting.append(Constraint('curvature_arc_arc', (('a', 'b', 'm'), 'b', ('c', 'd', 'n'), 'c')))
+        self.assertEqual(solve_constraints(shifted, {}, conflicting).status, 'conflict')
+        outside = dict(points, l1=[2., 1.], l2=[3., 1.])
+        fixed_outside = [Constraint('fixed', (name,), value) for name, value in outside.items()]
+        fixed_outside.append(Constraint('tangent_line_arc', (('l1', 'l2'), ('a', 'b', 'm'), 'b')))
+        self.assertEqual(solve_constraints(outside, {}, fixed_outside).status, 'conflict')
+
+    def test_arc_circle_curvature_and_reject_wrong_contact(self):
+        points = {'a': [-1., 0.], 'b': [0., 1.], 'm': [-2**-.5, 2**-.5], 'center': [0., 0.]}
+        fixed = [Constraint('fixed', (name,), value) for name, value in points.items()]
+        fixed.append(Constraint('radius', (('center', 'r'),), 1))
+        for kind in ('tangent_arc_circle', 'curvature_arc_circle'):
+            relation = Constraint(kind, (('a', 'b', 'm'), 'b', ('center', 'r')))
+            result = solve_constraints(points, {'r': 1}, fixed + [relation])
+            self.assertNotEqual(result.status, 'conflict')
+            self.assertLess(result.residual, 1e-7)
+        bad = dict(points, center=[0., -1.])
+        fixed_bad = [Constraint('fixed', (name,), value) for name, value in bad.items()]
+        fixed_bad.extend([Constraint('radius', (('center', 'r'),), 1),
+                          Constraint('tangent_arc_circle', (('a', 'b', 'm'), 'b', ('center', 'r')))])
+        self.assertEqual(solve_constraints(bad, {'r': 1}, fixed_bad).status, 'conflict')
+
     def graph(self, fixed=False):
         plane = Feature.create('Plane', 'datum_plane', {})
         constraints = [{'kind': 'fixed', 'entities': ['b'], 'value': [4, 0]}] if fixed else []
@@ -1534,6 +2611,59 @@ class ParametricSketchDragTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             set_circle_radius(graph, sketch.id, 0, 0)
 
+    def test_circle_dimension_rebuild_save_and_conflicting_drag(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {'points': {'c': [0, 0]},
+            'entities': [{'type': 'circle', 'center': 'c', 'radius': 2}]}, plane.id)
+        solid = Feature.create('Extrude', 'extrude', {'distance': 3}, sketch.id)
+        graph = FeatureGraph([plane, sketch, solid], {'size': 6})
+        dimension = {'kind': 'diameter', 'entities': [['c', '@circle:0']], 'value': 'size'}
+        updated = add_sketch_constraint(graph, sketch.id, dimension)
+        self.assertAlmostEqual(updated.results[solid.id].volume, 27 * math.pi, places=5)
+        with self.assertRaises(RebuildError):
+            set_circle_radius(updated, sketch.id, 0, 4)
+        self.assertAlmostEqual(updated.results[sketch.id].constraint_status.radii['@circle:0'], 3, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'circle.fcad'
+            save_snapshot(path, updated.results[solid.id], [], [], feature_graph=updated)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            restored.set_parameters({'size': 8})
+            self.assertAlmostEqual(restored.results[solid.id].volume, 48 * math.pi, places=5)
+
+    def test_circle_line_tangency_and_equal_radius(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [-5, 0], 'b': [5, 0], 'c': [0, 2], 'd': [8, 2]},
+            'entities': [{'type': 'line', 'points': ['a', 'b'], 'construction': True},
+                         {'type': 'circle', 'center': 'c', 'radius': 1},
+                         {'type': 'circle', 'center': 'd', 'radius': 2}],
+            'constraints': [{'kind': 'fixed', 'entities': ['a'], 'value': [-5, 0]},
+                            {'kind': 'fixed', 'entities': ['b'], 'value': [5, 0]},
+                            {'kind': 'fixed', 'entities': ['c'], 'value': [0, 2]},
+                            {'kind': 'tangent_line_circle', 'entities': [['a', 'b'], ['c', '@circle:1']]},
+                            {'kind': 'equal_radius', 'entities': [['c', '@circle:1'], ['d', '@circle:2']]}]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        radii = graph.results[sketch.id].constraint_status.radii
+        self.assertAlmostEqual(radii['@circle:1'], 2, places=6)
+        self.assertAlmostEqual(radii['@circle:2'], 2, places=6)
+
+    def test_external_circle_tangency_and_symmetry(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'a': [0, -5], 'b': [0, 5], 'c': [-3, 0], 'd': [3, 0]},
+            'entities': [{'type': 'line', 'points': ['a', 'b'], 'construction': True},
+                         {'type': 'circle', 'center': 'c', 'radius': 2},
+                         {'type': 'circle', 'center': 'd', 'radius': 2}],
+            'constraints': [{'kind': 'fixed', 'entities': ['a'], 'value': [0, -5]},
+                            {'kind': 'fixed', 'entities': ['b'], 'value': [0, 5]},
+                            {'kind': 'symmetric', 'entities': ['c', 'd', ['a', 'b']]},
+                            {'kind': 'tangent_circles_external', 'entities': [['c', '@circle:1'], ['d', '@circle:2']]}]}, plane.id)
+        graph = FeatureGraph([plane, sketch])
+        state = graph.results[sketch.id].constraint_status
+        self.assertAlmostEqual(np.linalg.norm(state.points['c'] - state.points['d']),
+                               state.radii['@circle:1'] + state.radii['@circle:2'], places=6)
+        self.assertAlmostEqual(state.points['c'][0], -state.points['d'][0], places=6)
+
     def test_constraint_is_transactional(self):
         graph, sketch, solid = self.graph()
         updated = add_sketch_constraint(graph, sketch.id,
@@ -1544,6 +2674,27 @@ class ParametricSketchDragTest(unittest.TestCase):
             add_sketch_constraint(updated, sketch.id,
                 {'kind': 'fixed', 'entities': ['b'], 'value': [6, 0]})
         self.assertAlmostEqual(updated.results[solid.id].volume, 32)
+
+    def test_line_constraints_and_removal_rebuild_transactionally(self):
+        graph, sketch, solid = self.graph()
+        parallel = {'kind': 'parallel', 'entities': [['a', 'b'], ['d', 'c']]}
+        constrained = add_sketch_constraint(graph, sketch.id, parallel)
+        angle = {'kind': 'angle', 'entities': [['a', 'b'], ['b', 'c']], 'value': '90'}
+        constrained = add_sketch_constraint(constrained, sketch.id, angle)
+        self.assertAlmostEqual(constrained.results[solid.id].volume, 32, places=5)
+        self.assertEqual(len(constrained.features[1].parameters['constraints']), 2)
+        removed = remove_sketch_constraint(constrained, sketch.id, 0)
+        self.assertEqual(removed.features[1].parameters['constraints'], [angle])
+        self.assertEqual(len(constrained.features[1].parameters['constraints']), 2)
+        with self.assertRaises(ValueError):
+            remove_sketch_constraint(constrained, sketch.id, 4)
+
+    def test_midpoint_constraint_moves_point_and_rebuilds(self):
+        graph, sketch, solid = self.graph()
+        constrained = add_sketch_constraint(graph, sketch.id, {
+            'kind': 'midpoint', 'entities': ['b', ['a', 'c']]})
+        points = constrained.results[sketch.id].constraint_status.points
+        np.testing.assert_allclose(points['b'], (points['a'] + points['c']) / 2, atol=1e-6)
 
     def test_arc_control_point_rebuilds_solid(self):
         plane = Feature.create('Plane', 'datum_plane', {})

@@ -2,7 +2,7 @@
 from PySide6 import QtWidgets
 from UI.model.constraints import Constraint
 from UI.model.expressions import evaluate_expression
-from UI.model.sketch_constraints import line_points, apply_constraint
+from UI.model.sketch_constraints import line_points, apply_constraint, history_line_points
 
 
 class ConstraintDialog(QtWidgets.QDialog):
@@ -23,7 +23,7 @@ class ConstraintDialog(QtWidgets.QDialog):
                            ('Vertical distance', 'vertical_distance')]:
             self.kind.addItem(label, key)
         self.first, self.second = QtWidgets.QComboBox(), QtWidgets.QComboBox()
-        names = list(line_points(manager))
+        names = list(history_line_points(manager) if manager.history_edit_id is not None else line_points(manager))
         self.first.addItems(names)
         self.second.addItems(names)
         if len(names) > 1:
@@ -56,6 +56,22 @@ class ConstraintDialog(QtWidgets.QDialog):
             first, second = self.first.currentText(), self.second.currentText()
             if not first or (kind != 'fixed' and (not second or first == second)):
                 raise ValueError('Choose distinct endpoints.')
+            if self.manager.history_edit_id is not None:
+                from UI.model.sketch_drag import add_sketch_constraint
+                points = history_line_points(self.manager)
+                entry = {'kind':kind}
+                if kind == 'fixed':
+                    entry.update(entities=[first], value=list(map(float, points[first])))
+                else:
+                    entry['entities'] = [[first, second]] if kind in ('horizontal','vertical') else [first, second]
+                    if kind in ('distance','horizontal_distance','vertical_distance'):
+                        entry['value'] = self.value.text()
+                candidate = add_sketch_constraint(self.manager.history_edit_graph, self.manager.history_edit_id, entry)
+                self.manager.history_edit_graph = candidate
+                self.manager.render_history_sketch()
+                state = candidate.results[self.manager.history_edit_id].constraint_status
+                self.message.setText(f'{state.status}; remaining degrees of freedom: {state.degrees_of_freedom}')
+                return
             points = line_points(self.manager)
             if kind == 'fixed':
                 constraint = Constraint(kind, (first,), tuple(points[first][2]))

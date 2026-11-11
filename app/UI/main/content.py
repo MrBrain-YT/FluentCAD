@@ -9,8 +9,9 @@ import numpy as np
 import vtk
 
 from UI.main.icons import tool_icon
-from UI.main.constraint_dialog import ConstraintDialog
 from UI.main.parametric_sketch_dialog import ParametricSketchDialog
+from UI.main.panel_inputs import PanelInputs
+from UI.main.operation_panel import OperationPanel
 from UI.main.extrude_dialog import ExtrudeDialog, RevolveDialog, PrimitiveDialog, TransformDialog, SolidFeatureDialog
 from UI.model.ActionManager import ActionManager
 from UI.model.export import export_body
@@ -34,6 +35,7 @@ class LayoutManager:
         self.action_manager.status_callback = lambda message: self.window.statusBar().showMessage(message)
         self.add_splitter()
         self.add_3d_viewport()
+        self.panel_inputs = PanelInputs(self)
         self.setup_cad_viewport()
         self.toggle_sidebar()
         self.add_style()
@@ -50,9 +52,20 @@ class LayoutManager:
             elif not cancelled and self.action_manager.sketch_editing and self.action_manager.active_tool is not None:
                 self.disable_active_tool()
                 self.action_manager.status_callback("Sketch tool stopped.")
+            elif not cancelled and self.action_manager.history_edit_id is not None:
+                self.action_manager.cancel_history_sketch()
+                self.tool_tabs.setCurrentWidget(self.tool_tabs_widgets['solid'])
         escape = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self.window)
         escape.activated.connect(cancel_selection)
         self.shortcuts.append(escape)
+        def finish_spline():
+            tool = self.action_manager.active_tool
+            if self.action_manager.sketch_editing and tool is not None and getattr(tool, 'type', '') in ('spline','fit_spline','nurbs','periodic_nurbs'):
+                tool.finish_drawing()
+        for key in ('Return', 'Enter'):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self.window)
+            shortcut.activated.connect(finish_spline)
+            self.shortcuts.append(shortcut)
         for key, callback in [("Ctrl+Z", self.action_manager.undo_solid),
                               ("Ctrl+Y", self.action_manager.redo_solid),
                               ("Ctrl+Shift+Z", self.action_manager.redo_solid)]:
@@ -205,7 +218,7 @@ class LayoutManager:
         if chosen != rename_action:
             return
         old_title = self.action_manager.timeline.entries[index]['title']
-        title, accepted = QtWidgets.QInputDialog.getText(self.window, 'Rename operation', 'Name:', text=old_title)
+        title, accepted = self.panel_inputs.getText(self.window, 'Rename operation', 'Name:', text=old_title)
         if accepted:
             try:
                 self.action_manager.timeline.rename(index, title)
@@ -220,20 +233,36 @@ class LayoutManager:
             if 0 <= index < len(graph.features):
                 feature = graph.features[index]
                 text = json.dumps(feature.parameters, ensure_ascii=False, indent=2)
-                QtWidgets.QMessageBox.information(self.window, feature.name, text)
+                self.show_timeline_parameters(feature.name, text)
             return
         entries = self.action_manager.timeline.entries
         if not 0 <= index < len(entries):
             return
         entry = entries[index]
         text = '\n'.join(f'{key}: {value}' for key, value in entry['parameters'].items()) or 'No parameters recorded.'
-        QtWidgets.QMessageBox.information(self.window, entry['title'], text)
+        self.show_timeline_parameters(entry['title'], text)
+
+    def show_timeline_parameters(self, title, text):
+        dialog = QtWidgets.QDialog()
+        dialog.setWindowTitle(title)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        details = QtWidgets.QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(text)
+        layout.addWidget(details)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        self.panel_inputs.exec_dialog(dialog)
 
     def parametric_context_menu(self, index, position):
         graph = self.action_manager.parametric_graph
         feature = graph.features[index]
         menu = QtWidgets.QMenu(self.timeline_widget)
-        sketch_action = menu.addAction('Edit sketch with mouse') if feature.kind == 'planar_sketch' else None
+        sketch_action = menu.addAction('Edit sketch in scene') if feature.kind == 'planar_sketch' else None
+        fallback_action = menu.addAction('Edit sketch in panel') if feature.kind == 'planar_sketch' else None
+        profiles_action = menu.addAction('Show sketch profiles') if feature.kind == 'planar_sketch' else None
+        reselect_action = menu.addAction('Reselect extrusion profile') if feature.kind == 'extrude' else None
         edit_action = menu.addAction('Edit parameters (JSON)')
         rename_action = menu.addAction('Rename')
         suppress_action = menu.addAction('Unsuppress' if feature.suppressed else 'Suppress')
@@ -243,37 +272,79 @@ class LayoutManager:
         if chosen is None:
             return
         try:
+            if profiles_action is not None and chosen == profiles_action:
+                self.action_manager.show_parametric_profiles(feature.id)
+                self.action_manager.status_callback('Click a sketch profile, then choose Extrude.')
+                return
+            if reselect_action is not None and chosen == reselect_action:
+                self.reselect_extrusion_profile(feature.id)
+                return
+            if sketch_action is not None and chosen == sketch_action:
+                self.action_manager.start_history_sketch(feature.id)
+                self.action_manager_ui.activate_scetch_mode(self.tool_tabs, 'sketch')
+                return
             candidate = FeatureGraph.from_data(graph.to_data())
-            if chosen == sketch_action and sketch_action is not None:
-                dialog = ParametricSketchDialog(candidate, feature.id, self.window)
-                if dialog.exec() != QtWidgets.QDialog.Accepted:
+            if chosen == fallback_action and fallback_action is not None:
+                dialog = ParametricSketchDialog(candidate, feature.id, self.window, self.panel_inputs)
+                if self.panel_inputs.exec_dialog(dialog) != QtWidgets.QDialog.Accepted:
                     return
                 candidate = dialog.graph
             elif chosen == edit_action:
-                text, ok = QtWidgets.QInputDialog.getMultiLineText(self.window, 'Edit parameters',
+                text, ok = self.panel_inputs.getMultiLineText(self.window, 'Edit parameters',
                     'Feature parameters (JSON):', json.dumps(feature.parameters, ensure_ascii=False, indent=2))
                 if not ok: return
                 value = json.loads(text)
                 if not isinstance(value, dict): raise ValueError('Parameters must be a JSON object.')
                 candidate.edit(feature.id, parameters=value)
             elif chosen == rename_action:
-                value, ok = QtWidgets.QInputDialog.getText(self.window, 'Rename feature', 'Name:', text=feature.name)
+                value, ok = self.panel_inputs.getText(self.window, 'Rename feature', 'Name:', text=feature.name)
                 if not ok: return
                 candidate.edit(feature.id, name=value)
             elif chosen == suppress_action:
                 candidate.edit(feature.id, suppressed=not feature.suppressed)
             elif chosen in (left_action, right_action):
                 candidate.reorder(feature.id, index + (-1 if chosen == left_action else 1))
-            self.action_manager.install_parametric_graph(candidate)
+            self.action_manager.install_parametric_graph(candidate, allow_empty=(chosen == suppress_action))
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self.window, 'Parametric rebuild', str(exc))
+
+    def reselect_extrusion_profile(self, feature_id):
+        manager = self.action_manager
+        graph = manager.parametric_graph
+        feature = next((item for item in graph.features if item.id == feature_id), None)
+        if feature is None or feature.kind != 'extrude' or not feature.input_id:
+            raise ValueError('Choose an extrusion with a sketch dependency.')
+        sketch_id = feature.input_id
+        profiles = manager.show_parametric_profiles(sketch_id)
+        if not profiles: raise ValueError('The sketch has no closed profiles.')
+        def selected(index):
+            try:
+                current = manager.parametric_graph
+                operation = next(item for item in current.features if item.id == feature_id)
+                sketch = current.results[sketch_id]
+                if not 0 <= index < len(sketch.profiles): raise ValueError('Profile is no longer available.')
+                key = sketch.profile_keys[index]
+                if key is None and len(sketch.profiles) > 1:
+                    raise ValueError('The selected profile cannot be identified unambiguously.')
+                params = dict(operation.parameters)
+                params.update(profile_index=index, profile_count=len(sketch.profiles))
+                params.pop('profile_key', None)
+                if key is not None: params['profile_key'] = key
+                candidate = FeatureGraph.from_data(current.to_data())
+                candidate.edit(feature_id, parameters=params)
+                manager.install_parametric_graph(candidate, allow_empty=True)
+                if manager.current_part is None: manager.show_parametric_profiles(sketch_id)
+                manager.status_callback('Extrusion profile updated.' + (' Unsuppress the operation to rebuild it.' if operation.suppressed else ''))
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self.window, 'Extrusion profile', str(exc))
+        manager.request_profile_selection(selected)
 
     def edit_graph_parameters(self):
         graph = self.action_manager.parametric_graph
         if graph is None:
             QtWidgets.QMessageBox.information(self.window, 'Parameters', 'Open or create a parametric model first.')
             return
-        text, ok = QtWidgets.QInputDialog.getMultiLineText(self.window, 'Parameters',
+        text, ok = self.panel_inputs.getMultiLineText(self.window, 'Parameters',
             'Named parameters as JSON expressions:', json.dumps(graph.parameters, ensure_ascii=False, indent=2))
         if not ok: return
         try:
@@ -312,7 +383,7 @@ class LayoutManager:
         kinds = ['primitive', 'datum_plane', 'rectangle_sketch', 'extrude', 'move', 'scale',
                  'mirror', 'rectangular_pattern', 'circular_pattern', 'fillet', 'chamfer', 'shell', 'hole', 'offset',
                  'planar_sketch', 'revolve']
-        kind, ok = QtWidgets.QInputDialog.getItem(self.window, 'Add feature', 'Type:', kinds, 0, False)
+        kind, ok = self.panel_inputs.getItem(self.window, 'Add feature', 'Type:', kinds, 0, False)
         if not ok: return
         templates = {
             'primitive': {'type': 'box', 'dimensions': [10, 10, 10], 'operation': 'new_body'},
@@ -341,7 +412,7 @@ class LayoutManager:
                 QtWidgets.QMessageBox.warning(self.window, 'Add feature', 'No dependency is available.')
                 return
             labels = [f'{name} ({fid[:8]})' for name, fid in candidates]
-            selected, ok = QtWidgets.QInputDialog.getItem(self.window, 'Add feature', 'Input feature:', labels, len(labels) - 1, False)
+            selected, ok = self.panel_inputs.getItem(self.window, 'Add feature', 'Input feature:', labels, len(labels) - 1, False)
             if not ok: return
             input_id = candidates[labels.index(selected)][1]
         if kind in ('fillet', 'chamfer', 'shell', 'hole'):
@@ -363,7 +434,7 @@ class LayoutManager:
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self.window, 'Add feature', str(exc))
                 return
-        text, ok = QtWidgets.QInputDialog.getMultiLineText(self.window, 'Add feature', 'Parameters (JSON):',
+        text, ok = self.panel_inputs.getMultiLineText(self.window, 'Add feature', 'Parameters (JSON):',
                                                            json.dumps(templates[kind], indent=2))
         if not ok: return
         try:
@@ -392,7 +463,6 @@ class LayoutManager:
         self.tool_tabs.setEnabled(False)
         for shortcut in self.shortcuts:
             shortcut.setEnabled(False)
-        dialog.setWindowModality(QtCore.Qt.NonModal)
         def finished(result):
             manager.interaction_locked = False
             self.tool_tabs.setEnabled(True)
@@ -404,8 +474,34 @@ class LayoutManager:
                 except Exception as exc:
                     QtWidgets.QMessageBox.warning(self.window, title, str(exc))
             self.active_operation_dialog = None
+            self.operation_panel.hide()
+            self.operation_content.layout().removeWidget(dialog)
+            dialog.deleteLater()
         dialog.finished.connect(finished)
+        self.show_operation_panel(dialog)
+
+    def show_operation_panel(self, dialog):
+        self.operation_title.setText(dialog.windowTitle())
+        self.operation_title.setChecked(True)
+        self.operation_title.setArrowType(QtCore.Qt.DownArrow)
+        dialog.setParent(self.operation_content, QtCore.Qt.Widget)
+        dialog.setMinimumWidth(0)
+        for combo in dialog.findChildren(QtWidgets.QComboBox):
+            combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        for number in dialog.findChildren(QtWidgets.QAbstractSpinBox):
+            number.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+            number.setMinimumWidth(0)
+            number.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self.operation_content.layout().addWidget(dialog)
+        self.operation_content.show()
+        self.operation_scroll.show()
+        self.operation_panel.show()
         dialog.show()
+        if hasattr(self.operation_panel, 'queue_reposition'):
+            self.operation_panel.queue_reposition()
 
     def get_main_layout(self) -> QtWidgets.QVBoxLayout:
         main_layout = QtWidgets.QVBoxLayout(self.central_widget)
@@ -451,16 +547,69 @@ class LayoutManager:
         self.main_layout.addWidget(self.splitter)
         
     def add_3d_viewport(self):
-        render_layout = QtWidgets.QVBoxLayout(self.render_container)
+        render_layout = QtWidgets.QHBoxLayout(self.render_container)
         render_layout.setContentsMargins(0,0,0,0)
+        render_layout.setSpacing(0)
 
         self.plotter = QtInteractor(self.render_container)
-        render_layout.addWidget(self.plotter)
+        render_layout.addWidget(self.plotter, 1)
+        self.operation_panel = OperationPanel(self.render_container)
+        panel_layout = QtWidgets.QVBoxLayout(self.operation_panel)
+        panel_layout.setContentsMargins(1, 1, 1, 1)
+        panel_layout.setSpacing(0)
+        self.operation_title = QtWidgets.QToolButton()
+        self.operation_title.setCheckable(True)
+        self.operation_title.setChecked(True)
+        self.operation_title.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.operation_title.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.operation_title.setObjectName('operationTitle')
+        panel_layout.addWidget(self.operation_title)
+        self.operation_content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(self.operation_content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        self.operation_scroll = QtWidgets.QScrollArea()
+        self.operation_scroll.setWidgetResizable(True)
+        self.operation_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.operation_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.operation_scroll.setWidget(self.operation_content)
+        panel_layout.addWidget(self.operation_scroll)
+        self.operation_panel.title = self.operation_title
+        self.operation_panel.content = self.operation_content
+        self.operation_panel.scroll = self.operation_scroll
+        self.operation_title.toggled.connect(self.operation_scroll.setVisible)
+        self.operation_title.toggled.connect(lambda expanded: self.operation_title.setArrowType(
+            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow))
+        self.operation_title.toggled.connect(self.operation_panel.queue_reposition)
+        self.operation_panel.setStyleSheet('''
+            QFrame#operationPanel { background: #f3f3f3; border: 1px solid #b6b6b6; }
+            QToolButton#operationTitle { background: #e5e5e5; border: 0; border-bottom: 1px solid #c6c6c6;
+                color: #303030; text-align: left; padding: 3px 5px; font-weight: bold; }
+            QScrollArea, QWidget { background: #f3f3f3; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {
+                background: white; border: 1px solid #c6c6c6; padding: 2px; }
+            QPushButton { background: #eeeeee; border: 1px solid #bcbcbc; padding: 3px 10px; }
+            QPushButton:hover { background: #e0edf5; border-color: #73a9c8; }
+        ''')
+        self.operation_panel.hide()
         
     def setup_cad_viewport(self):
         self.plotter.set_background("#CECECE", top="#CECECE")
+        # Intersecting translucent datum planes must be composited per pixel;
+        # sorting whole plane actors makes them appear cut at their crossings.
+        self.plotter.ren_win.SetAlphaBitPlanes(1)
+        self.plotter.ren_win.SetMultiSamples(0)
+        self.plotter.renderer.SetUseDepthPeeling(True)
+        self.plotter.renderer.SetMaximumNumberOfPeels(8)
+        self.plotter.renderer.SetOcclusionRatio(0.0)
         try:
-            self.plotter.add_camera_orientation_widget(n_frames=100)
+            orientation = self.plotter.add_camera_orientation_widget(n_frames=20)
+            def navigation_size():
+                representation = orientation.GetRepresentation()
+                size, padding = representation.GetSize(), representation.GetPadding()
+                ratio = max(1., self.plotter.devicePixelRatioF())
+                return tuple(int((size[i] + 2 * padding[i]) / ratio + .999) for i in (0, 1))
+            self.operation_panel.navigation_size = navigation_size
+            self.operation_panel.queue_reposition()
         except AttributeError:
             self.plotter.add_axes()
 
@@ -540,20 +689,23 @@ class LayoutManager:
         tool_bar, top_layout = self.ribbon_layout()
         
         def open_sketch():
-            if not self.require_snapshot_mode():
-                return
             self.action_manager.activate_sketch_mode()
             self.action_manager_ui.activate_scetch_mode(self.tool_tabs, "sketch")
             
         def extrude():
-            if not self.require_snapshot_mode():
-                return
             manager = self.action_manager
             if manager.sketch_editing:
                 self.disable_active_tool()
-                manager.exit_sketch_mode()
+                try:
+                    manager.exit_sketch_mode()
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(self.window, 'Sketch', str(exc))
+                    return
             if not manager.profiles:
                 try:
+                    if manager.parametric_graph is not None:
+                        QtWidgets.QMessageBox.information(self.window, 'Extrude', 'Finish a parametric sketch or use Show sketch profiles in the Timeline.')
+                        return
                     if not manager.prepare_selected_face_profile():
                         QtWidgets.QMessageBox.information(self.window, "Extrude", "Select a planar face or finish a sketch containing a closed profile first.")
                         return
@@ -567,7 +719,6 @@ class LayoutManager:
                 self.tool_tabs.setEnabled(False)
                 for shortcut in self.shortcuts:
                     shortcut.setEnabled(False)
-                dialog.setWindowModality(QtCore.Qt.NonModal)
                 def finished(result):
                     manager.interaction_locked = False
                     self.tool_tabs.setEnabled(True)
@@ -575,13 +726,22 @@ class LayoutManager:
                         shortcut.setEnabled(True)
                     if result == QtWidgets.QDialog.Accepted and dialog.result_shape is not None:
                         try:
-                            manager.commit_result(dialog.result_shape, dialog.windowTitle(), self.operation_parameters(dialog))
+                            if manager.parametric_graph is not None:
+                                manager.commit_parametric_extrusion(index, dialog.distance.value(), dialog.operation.currentData(),
+                                    dialog.offset.value(), dialog.taper.value(), dialog.direction.currentData() == 'symmetric',
+                                    dialog.second_distance.value() if dialog.direction.currentData() == 'two' else None,
+                                    dialog.extent.currentData())
+                            else:
+                                manager.commit_result(dialog.result_shape, dialog.windowTitle(), self.operation_parameters(dialog))
                         except Exception as exc:
                             QtWidgets.QMessageBox.warning(self.window, "Extrude", str(exc))
                     manager.clear_temporary_face_profile()
                     self.active_operation_dialog = None
+                    self.operation_panel.hide()
+                    self.operation_content.layout().removeWidget(dialog)
+                    dialog.deleteLater()
                 dialog.finished.connect(finished)
-                dialog.show()
+                self.show_operation_panel(dialog)
 
             if manager.selected_profile_index is not None:
                 extrude_selected(manager.selected_profile_index)
@@ -714,10 +874,10 @@ class LayoutManager:
                 return
             bases = ["XY", "XZ", "YZ", "Selected planar face"]
             default = 3 if manager.current_part is not None and manager.selected_face_id >= 0 else 0
-            base, ok = QtWidgets.QInputDialog.getItem(self.window, "Offset plane", "Base plane:", bases, default, False)
+            base, ok = self.panel_inputs.getItem(self.window, "Offset plane", "Base plane:", bases, default, False)
             if not ok:
                 return
-            offset, ok = QtWidgets.QInputDialog.getDouble(self.window, "Offset plane", "Offset:", 10.0, -1000000, 1000000, 3)
+            offset, ok = self.panel_inputs.getDouble(self.window, "Offset plane", "Offset:", 10.0, -1000000, 1000000, 3)
             if ok:
                 try:
                     if base == "Selected planar face":
@@ -840,14 +1000,25 @@ class LayoutManager:
                 manager.timeline_callback()
                 manager.sketchs_data.clear()
                 manager.activated_sketch_id = None
+                manager.legacy_migration_redo = None
                 self.window.statusBar().showMessage(f"Model snapshot opened: {path}", 5000)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self.window, "Open model", str(exc))
+
+        def convert_legacy_model():
+            try:
+                self.action_manager.convert_legacy_model()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self.window, 'Convert model', str(exc))
+                return
+            QtWidgets.QMessageBox.information(self.window, 'Convert model',
+                'The existing solid is now a frozen base feature. Earlier operations cannot be reconstructed; Undo restores the previous snapshot history.')
 
         self.ribbon_group(top_layout, "File", [
             ("parametric_new", "New parametric model", self.new_parametric_model),
             ("parametric_add", "Add parametric feature", self.add_graph_feature),
             ("parametric_parameters", "Edit named parameters", self.edit_graph_parameters),
+            ("parametric_convert", "Convert legacy model to parametric", convert_legacy_model),
             ("save", "Save solid model snapshot", save_model_snapshot),
             ("open", "Open solid model snapshot", open_model_snapshot),
             ("export", "Export STEP / STL", export_model),
@@ -1000,10 +1171,27 @@ class LayoutManager:
                 return
             self.disable_active_tool()
             self.action_manager.activate_ellipse_arc_mode()
+
+        def start_spline(kind):
+            if not self.action_manager.sketch_editing:
+                QtWidgets.QMessageBox.information(self.window, 'Sketch', 'Select a sketch plane first.')
+                return
+            self.disable_active_tool()
+            self.action_manager.activate_spline_mode(kind)
+
+        def start_parametric_slot(method):
+            try:
+                getattr(scene_commands(), method)()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self.window, 'Slot', str(exc))
             
         def exit_sketch():
             self.disable_active_tool()
-            self.action_manager.exit_sketch_mode()
+            try:
+                self.action_manager.exit_sketch_mode()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self.window, 'Sketch', str(exc))
+                return
             self.tool_tabs.setCurrentWidget(self.tool_tabs_widgets["solid"])
             if not self.action_manager.profiles:
                 QtWidgets.QMessageBox.information(self.window, "Sketch", "No closed profile was found. Connect the endpoints to form a closed contour.")
@@ -1014,7 +1202,7 @@ class LayoutManager:
                 return
             sides = 6
             if kind in ("polygon", "circumscribed_polygon", "edge_polygon"):
-                sides, ok = QtWidgets.QInputDialog.getInt(self.window, "Polygon", "Number of sides:", 6, 3, 128)
+                sides, ok = self.panel_inputs.getInt(self.window, "Polygon", "Number of sides:", 6, 3, 128)
                 if not ok:
                     return
             self.disable_active_tool()
@@ -1061,6 +1249,10 @@ class LayoutManager:
             ("circle_2point", "2-point circle", lambda: start_point_circle("diameter")),
             ("circle_3point", "3-point circle", lambda: start_point_circle("three_point")),
             ("curve", "3-point arc", start_curve),
+            ("spline", "Bezier spline", lambda: start_spline('spline')),
+            ("fit_spline", "Fit-point spline", lambda: start_spline('fit_spline')),
+            ("nurbs", "NURBS", lambda: start_spline('nurbs')),
+            ("periodic_nurbs", "Periodic NURBS", lambda: start_spline('periodic_nurbs')),
             ("center_arc", "Center-point arc", lambda: start_arc_variant("center")),
             ("ellipse", "Ellipse", start_ellipse_arc),
             ("ellipse_arc", "Elliptical arc", lambda: start_arc_variant("ellipse")),
@@ -1068,28 +1260,62 @@ class LayoutManager:
             ("slot", "Center-to-center slot", lambda: start_slot("center_to_center")),
             ("slot_overall", "Overall slot", lambda: start_slot("overall")),
             ("slot_center", "Center-point slot", lambda: start_slot("center_point")),
+            ("slot_polyline", "Polyline slot", lambda: start_parametric_slot('create_polyline_slot')),
+            ("slot_arc", "Arc slot", lambda: start_parametric_slot('create_arc_slot')),
+            ("slot_spline", "Spline slot", lambda: start_parametric_slot('create_spline_slot')),
+            ("slot_composite", "Composite curve slot", lambda: start_parametric_slot('create_composite_slot')),
             ("polygon", "Inscribed polygon", lambda: start_shape("polygon")),
             ("circumscribed_polygon", "Circumscribed polygon", lambda: start_shape("circumscribed_polygon")),
             ("edge_polygon", "Edge polygon", lambda: start_shape("edge_polygon")),
         ]
         self.ribbon_group(top_layout, "Create", create_commands,
-                          {"line", "rectangle", "circle", "curve", "ellipse"})
-        def open_constraints():
+                          {"line", "rectangle", "circle", "curve", "ellipse", "spline"})
+        def scene_commands():
             if not self.action_manager.sketch_editing:
-                QtWidgets.QMessageBox.information(self.window, "Constraints", "Select a sketch plane first.")
-                return
+                raise ValueError('Select a sketch plane first.')
             self.disable_active_tool()
-            if not any(tool.type == 'line' and tool.points for tool in self.action_manager.get_current_sketch_data()['sketch_func']):
-                QtWidgets.QMessageBox.information(self.window, "Constraints", "Draw a line or polygon first.")
-                return
-            ConstraintDialog(self.action_manager, self.window).exec()
+            manager = self.action_manager
+            if manager.history_edit_id is None:
+                manager.promote_current_sketch()
+            else:
+                manager.flush_history_tools()
+            from UI.main.scene_sketch_commands import SceneSketchCommands
+            return SceneSketchCommands(manager, self.window, self.panel_inputs)
+
+        def open_constraints():
+            try:
+                manager = self.action_manager
+                if manager.sketch_editing and manager.history_edit_id is None and manager.parametric_graph is None and manager.current_part is not None:
+                    from UI.main.constraint_dialog import ConstraintDialog
+                    self.disable_active_tool()
+                    self.panel_inputs.exec_dialog(ConstraintDialog(manager, self.window))
+                    return
+                scene_commands().create_constraint()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self.window, 'Constraints', str(exc))
 
         constraint_button = QtWidgets.QToolButton()
         constraint_button.setProperty("ribbon", True)
         constraint_button.setText("Constraints")
-        constraint_button.setToolTip("Line endpoint constraints and dimensions")
+        constraint_button.setToolTip("Sketch constraints and dimensions")
         constraint_button.clicked.connect(open_constraints)
         top_layout.addWidget(constraint_button)
+        remove_constraints = QtWidgets.QToolButton()
+        remove_constraints.setProperty('ribbon', True)
+        remove_constraints.setText('Remove constraint')
+        def remove_constraint():
+            try: scene_commands().remove_constraint()
+            except Exception as exc: QtWidgets.QMessageBox.warning(self.window, 'Constraints', str(exc))
+        remove_constraints.clicked.connect(remove_constraint)
+        top_layout.addWidget(remove_constraints)
+        nurbs_parameters = QtWidgets.QToolButton()
+        nurbs_parameters.setProperty('ribbon', True)
+        nurbs_parameters.setText('NURBS parameters')
+        def edit_nurbs():
+            try: scene_commands().edit_nurbs_parameters()
+            except Exception as exc: QtWidgets.QMessageBox.warning(self.window, 'NURBS', str(exc))
+        nurbs_parameters.clicked.connect(edit_nurbs)
+        top_layout.addWidget(nurbs_parameters)
 
         grid_button = QtWidgets.QToolButton()
         grid_button.setProperty("ribbon", True)

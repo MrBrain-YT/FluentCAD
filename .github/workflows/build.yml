@@ -1,0 +1,98 @@
+name: Проверка и сборка FluentCAD
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Проверка и сборка (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYVISTA_OFF_SCREEN: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Установить системные библиотеки Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxrender1 libxkbcommon-x11-0 libxcb-cursor0 libsm6 libice6 libfontconfig1
+      - name: Установить зависимости
+        run: python -m pip install -r requirements.txt pyinstaller==6.16.0
+      - name: Запустить автоматические тесты
+        run: python -m unittest discover -s tests -v
+      - name: Собрать приложение
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onedir --windowed
+          --name FluentCAD --paths app --add-data "app/UI/images:UI/images"
+          --collect-all build123d --collect-all OCP --collect-all pyvista
+          --collect-all pyvistaqt --collect-all vtkmodules app/main.py
+      - name: Проверить сборку Windows без интерфейса
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath (Resolve-Path 'dist/FluentCAD/FluentCAD.exe') -ArgumentList '--smoke-test' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Проверка сборки завершилась с кодом $($process.ExitCode)" }
+      - name: Проверить сборку Linux без интерфейса
+        if: runner.os == 'Linux'
+        run: ./dist/FluentCAD/FluentCAD --smoke-test
+      - name: Упаковать Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/FluentCAD -DestinationPath FluentCAD-windows-x86_64.zip
+      - name: Упаковать Linux
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf FluentCAD-linux-x86_64.tar.gz FluentCAD
+      - name: Сохранить сборку Windows
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluentCAD-windows-x86_64
+          path: FluentCAD-windows-x86_64.zip
+          if-no-files-found: error
+      - name: Сохранить сборку Linux
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluentCAD-linux-x86_64
+          path: FluentCAD-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Опубликовать релиз
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Создать релиз или обновить архивы
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/FluentCAD-* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/FluentCAD-* --verify-tag --generate-notes
+          fi

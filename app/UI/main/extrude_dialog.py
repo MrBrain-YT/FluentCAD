@@ -51,10 +51,10 @@ class ExtrudeDialog(QtWidgets.QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         for control in (self.distance, self.second_distance, self.offset, self.taper):
-            control.valueChanged.connect(self.update_preview)
-        self.extent.currentIndexChanged.connect(self.update_preview)
-        self.direction.currentIndexChanged.connect(self.update_preview)
-        self.operation.currentIndexChanged.connect(self.update_preview)
+            control.valueChanged.connect(self.request_preview)
+        self.extent.currentIndexChanged.connect(self.request_preview)
+        self.direction.currentIndexChanged.connect(self.request_preview)
+        self.operation.currentIndexChanged.connect(self.request_preview)
         self.handle = None
         self.finished.connect(self.clear_preview)
         self.update_preview()
@@ -71,6 +71,27 @@ class ExtrudeDialog(QtWidgets.QDialog):
         control.setValue(value)
         control.setKeyboardTracking(False)
         return control
+
+    def request_preview(self, *args):
+        """Coalesce rapid field and drag events without committing an old result."""
+        timer = getattr(self, '_preview_timer', None)
+        if timer is None:
+            timer = self._preview_timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(40)
+            timer.timeout.connect(self.update_preview)
+        self.result_shape = None
+        self.buttons.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+        if not timer.isActive():
+            timer.start()
+
+    def accept(self):
+        timer = getattr(self, '_preview_timer', None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            self.update_preview()
+        if self.result_shape is not None:
+            super().accept()
 
     def update_preview(self, *args):
         is_distance = self.extent.currentData() == 'distance'
@@ -93,10 +114,11 @@ class ExtrudeDialog(QtWidgets.QDialog):
             shape = self.build_shape()
             mesh = b123d_to_pro_mesh(shape, 0.01, 0.1)
             self.manager.plotter.add_mesh(mesh, name='extrude_preview', color='#5aade0',
-                                          opacity=0.55, pickable=False, reset_camera=False)
+                                          opacity=0.55, pickable=False, reset_camera=False, render=False)
             if body is not None:
                 body.SetVisibility(False)
             self.result_shape = shape
+            if hasattr(self.manager, 'refresh_camera_clipping'): self.manager.refresh_camera_clipping()
             self.message.clear()
         except Exception as exc:
             self.message.setText(str(exc))
@@ -111,6 +133,9 @@ class ExtrudeDialog(QtWidgets.QDialog):
             self.extent.currentData())
 
     def clear_preview(self, *args):
+        timer = getattr(self, '_preview_timer', None)
+        if timer is not None:
+            timer.stop()
         handle = getattr(self, 'handle', None)
         if handle is not None:
             handle.close()
@@ -153,9 +178,9 @@ class RevolveDialog(ExtrudeDialog):
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
-        self.angle.valueChanged.connect(self.update_preview)
-        self.axis.currentIndexChanged.connect(self.update_preview)
-        self.operation.currentIndexChanged.connect(self.update_preview)
+        self.angle.valueChanged.connect(self.request_preview)
+        self.axis.currentIndexChanged.connect(self.request_preview)
+        self.operation.currentIndexChanged.connect(self.request_preview)
         self.finished.connect(self.clear_preview)
         self.update_preview()
         try:
@@ -213,8 +238,8 @@ class PrimitiveDialog(ExtrudeDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         for control in self.dimensions + self.position:
-            control.valueChanged.connect(self.update_preview)
-        self.operation.currentIndexChanged.connect(self.update_preview)
+            control.valueChanged.connect(self.request_preview)
+        self.operation.currentIndexChanged.connect(self.request_preview)
         self.finished.connect(self.clear_preview)
         self.update_preview()
         axes = {'box': ('X', 'Y', 'Z'), 'cylinder': ('X', 'Z'), 'sphere': ('X',),
@@ -258,30 +283,30 @@ class TransformDialog(ExtrudeDialog):
         if self.selected_body is not None:
             self.scope.addItem('Selected body', 'selected')
             self.scope.setCurrentIndex(1)
-        self.scope.currentIndexChanged.connect(self.update_preview)
+        self.scope.currentIndexChanged.connect(self.request_preview)
         form.addRow('Target', self.scope)
         def number(key, label, value=0., minimum=-1000000., maximum=1000000.):
             widget = self.number(value, minimum, maximum)
-            widget.valueChanged.connect(self.update_preview)
+            widget.valueChanged.connect(self.request_preview)
             self.controls[key] = widget
             form.addRow(label, widget)
         def integer(key, label, value):
             widget = QtWidgets.QSpinBox()
             widget.setRange(1, 100)
             widget.setValue(value)
-            widget.valueChanged.connect(self.update_preview)
+            widget.valueChanged.connect(self.request_preview)
             self.controls[key] = widget
             form.addRow(label, widget)
         def choice(key, label, choices):
             widget = QtWidgets.QComboBox()
             widget.addItems(choices)
-            widget.currentIndexChanged.connect(self.update_preview)
+            widget.currentIndexChanged.connect(self.request_preview)
             self.controls[key] = widget
             form.addRow(label, widget)
         def copy_option(default=False):
             widget = QtWidgets.QCheckBox('Keep original bodies')
             widget.setChecked(default)
-            widget.toggled.connect(self.update_preview)
+            widget.toggled.connect(self.request_preview)
             self.controls['copy'] = widget
             form.addRow(widget)
         if kind == 'move':
@@ -399,12 +424,12 @@ class SolidFeatureDialog(ExtrudeDialog):
             if self.selected_body is not None:
                 self.scope.addItem('Selected body', 'selected')
                 self.scope.setCurrentIndex(1)
-            self.scope.currentIndexChanged.connect(self.update_preview)
+            self.scope.currentIndexChanged.connect(self.request_preview)
             form.addRow('Target', self.scope)
         def number(key, title, default, minimum=-1000000., maximum=1000000.):
             field = self.number(default, minimum, maximum)
             self.controls[key] = field
-            field.valueChanged.connect(self.update_preview)
+            field.valueChanged.connect(self.request_preview)
             form.addRow(title, field)
         if kind in ('fillet', 'fillet_selected'):
             number('value', 'Radius', 1., 0.)
@@ -420,7 +445,7 @@ class SolidFeatureDialog(ExtrudeDialog):
             number('offset_u', 'Position U', 0.)
             number('offset_v', 'Position V', 0.)
             through = QtWidgets.QCheckBox('Through all')
-            through.toggled.connect(self.update_preview)
+            through.toggled.connect(self.request_preview)
             self.controls['through'] = through
             form.addRow(through)
         layout.addLayout(form)

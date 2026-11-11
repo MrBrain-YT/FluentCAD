@@ -152,11 +152,18 @@ def tool_icon(kind):
         painter.drawPoint(16, 16)
     elif kind in ('curve', 'center_arc'):
         painter.drawArc(5, 7, 22, 22, 25 * 16, 130 * 16)
+    elif kind in ('spline', 'fit_spline', 'nurbs', 'periodic_nurbs'):
+        path = QtGui.QPainterPath(QtCore.QPointF(4, 24))
+        path.cubicTo(8, 4, 21, 28, 28, 7)
+        painter.drawPath(path)
+        painter.setBrush(QtGui.QColor('#ffffff'))
+        painter.drawEllipse(QtCore.QPointF(4, 24), 2, 2)
+        painter.drawEllipse(QtCore.QPointF(28, 7), 2, 2)
     elif kind in ('ellipse', 'ellipse_arc'):
         painter.drawEllipse(4, 10, 24, 12)
     elif kind in ('polygon', 'circumscribed_polygon', 'edge_polygon'):
         painter.drawPolygon(QtGui.QPolygon([QtCore.QPoint(10, 5), QtCore.QPoint(22, 5), QtCore.QPoint(28, 16), QtCore.QPoint(22, 27), QtCore.QPoint(10, 27), QtCore.QPoint(4, 16)]))
-    elif kind in ('slot', 'slot_overall', 'slot_center'):
+    elif kind in ('slot', 'slot_overall', 'slot_center', 'slot_polyline', 'slot_arc', 'slot_spline', 'slot_composite'):
         painter.drawRoundedRect(4, 10, 24, 12, 6, 6)
     elif kind == 'point':
         painter.setBrush(QtGui.QColor('#347ca4'))

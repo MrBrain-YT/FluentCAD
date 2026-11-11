@@ -67,7 +67,7 @@ class StraightShape(SkecthObj):
 
     def start(self):
         self.is_drawing = True
-        self.plotter.track_click_position(callback=self.on_click, side='left')
+        self.track_sketch_click()
 
     def on_click(self, position):
         if not self.is_drawing:

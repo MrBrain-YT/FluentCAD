@@ -20,7 +20,7 @@ class Line(SkecthObj):
     
     def create_line(self):
         self.is_drawing = True
-        self.plotter.track_click_position(callback=self.on_click, side='left')
+        self.track_sketch_click()
         self.preview_observer = self.plotter.iren.add_observer('MouseMoveEvent', self.draw_preview_line)
         # self.plotter.track_click_position(callback=self.stop_drawing_line, side='right')
         # self.plotter.add_key_event("Delete", self.sketch_instance.delete_selected)
