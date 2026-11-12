@@ -41,16 +41,27 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onedir --windowed
           --name FluentCAD --paths app --add-data "app/UI/images:UI/images"
           --collect-all build123d --collect-all OCP --collect-all pyvista
-          --collect-all pyvistaqt --collect-all vtkmodules app/main.py
+          --collect-all pyvistaqt --collect-all vtkmodules
+          --collect-all lib3mf app/main.py
       - name: Проверить сборку Windows без интерфейса
         if: runner.os == 'Windows'
+        timeout-minutes: 2
         shell: pwsh
         run: |
-          $process = Start-Process -FilePath (Resolve-Path 'dist/FluentCAD/FluentCAD.exe') -ArgumentList '--smoke-test' -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Проверка сборки завершилась с кодом $($process.ExitCode)" }
+          $process = Start-Process `
+            -FilePath (Resolve-Path 'dist/FluentCAD/FluentCAD.exe') `
+            -ArgumentList '--smoke-test' -PassThru
+          if (-not $process.WaitForExit(90000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Smoke-проверка зависла"
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Smoke-проверка завершилась с кодом $($process.ExitCode)"
+          }
       - name: Проверить сборку Linux без интерфейса
         if: runner.os == 'Linux'
-        run: ./dist/FluentCAD/FluentCAD --smoke-test
+        timeout-minutes: 2
+        run: timeout 90s ./dist/FluentCAD/FluentCAD --smoke-test
       - name: Упаковать Windows
         if: runner.os == 'Windows'
         shell: pwsh
