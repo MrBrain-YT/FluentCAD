@@ -1,10 +1,12 @@
 """Serializable 2-D geometry for parametric feature sketches."""
 from dataclasses import dataclass
+from functools import cached_property
 from types import SimpleNamespace
 import math
 import numpy as np
 from UI.model.profiles import build_profiles
 from UI.model.constraints import Constraint, solve_constraints
+from UI.model.sketch_projection_curves import named_sketch_curves
 
 
 @dataclass(frozen=True)
@@ -14,13 +16,34 @@ class ParametricSketch:
     constraint_status: object = None
     profile_keys: tuple = ()
     tools: tuple = ()
+    axis_segments: tuple = ()
+    linked_edges: tuple = ()
+    linked_points: tuple = ()
+    detached_edges: tuple = ()
+    detached_points: tuple = ()
+    entities: tuple = ()
+    spatial_edges: tuple = ()
+    off_plane_edge_names: frozenset = frozenset()
+    offset_edges: tuple = ()
+    corner_edges: tuple = ()
+    mirror_edges: tuple = ()
+    mirror_points: tuple = ()
+    mirror_construction_edges: frozenset = frozenset()
+    pattern_edges: tuple = ()
+    pattern_points: tuple = ()
+    pattern_construction_edges: frozenset = frozenset()
+
+    @cached_property
+    def projectable_curves(self):
+        return named_sketch_curves(self.entities, self.tools, np.asarray(tuple(self.plane.z_dir)))
 
 
 def circle_radius_name(index):
     return f'@circle:{index}'
 
 
-def build_sketch(plane, entities, number, points=None, constraints=None):
+def build_sketch(plane, entities, number, points=None, constraints=None, linked_geometry=(), detached_geometry=(),
+                 offsets=None, corners=None, mirrors=None, patterns=None):
     if not isinstance(entities, list) or len(entities) > 1000:
         raise ValueError('Sketch entities must be a list with at most 1000 items.')
     solved = None
@@ -186,7 +209,7 @@ def build_sketch(plane, entities, number, points=None, constraints=None):
         if not isinstance(value, (tuple, list)) or len(value) != 2:
             raise ValueError('Sketch point must contain two coordinates.')
         return np.asarray(tuple(plane.from_local_coords((number(value[0]), number(value[1]), 0))), dtype=float)
-    tools = []
+    tools, axis_segments = [], []
     for index, entity in enumerate(entities):
         if not isinstance(entity, dict):
             raise ValueError('Invalid sketch entity.')
@@ -199,6 +222,11 @@ def build_sketch(plane, entities, number, points=None, constraints=None):
             if not isinstance(values, list) or len(values) < 2:
                 raise ValueError('Line requires at least two points.')
             tool = SimpleNamespace(type='line', points=[point(value) for value in values])
+            for i, (start, end) in enumerate(zip(tool.points, tool.points[1:])):
+                if np.linalg.norm(end - start) < 1e-9:
+                    continue
+                reference = {'kind': 'sketch_line', 'points': values[i:i + 2]}
+                axis_segments.append((reference, (start, end)))
         elif kind == 'spline':
             values = entity.get('points')
             if not isinstance(values, list) or len(values) != 4:
@@ -314,9 +342,56 @@ def build_sketch(plane, entities, number, points=None, constraints=None):
             tool = SimpleNamespace(type='composite_path_slot', points=[], segments=segments, plane=plane, radius=radius)
         else:
             raise ValueError(f'Unsupported sketch entity: {kind}')
+        if 'curve_spans' in entity:
+            from UI.model.curve_spans import CURVE_TYPES, validate_curve_spans
+            if kind not in CURVE_TYPES:
+                raise ValueError('Edited curve ranges require an ellipse or a spline.')
+            tool.curve_spans = validate_curve_spans(entity['curve_spans'])
         tool.is_construction = construction
         tools.append(tool)
-    profiles = build_profiles(tools, np.asarray(tuple(plane.z_dir)))
+    links = tuple((name, edge) for result in linked_geometry for name, edge in result.edges)
+    linked_points = tuple(point for result in linked_geometry for point in result.points)
+    detached = tuple((name, edge) for result in detached_geometry for name, edge in result.edges)
+    detached_points = tuple(point for result in detached_geometry for point in result.points)
+    spatial_edges = tuple((name, edge) for result in (*linked_geometry, *detached_geometry)
+                          if result.spatial for name, edge in result.edges)
+    off_plane = set()
+    for name, edge in spatial_edges:
+        bounds = plane.to_local_coords(edge).bounding_box()
+        if max(abs(bounds.min.Z), abs(bounds.max.Z)) > 1e-6:
+            off_plane.add(name)
+    normal = np.asarray(tuple(plane.z_dir))
+    corner_edges, corner_sources = (), {}
+    if corners is not None:
+        from UI.model.sketch_corners import rebuild_sketch_corners
+        corner_edges, corner_sources = rebuild_sketch_corners(corners, plane, entities, tools, normal, number)
+    offset_edges = ()
+    if offsets is not None:
+        from UI.model.sketch_offset import rebuild_sketch_offsets
+        offset_edges = rebuild_sketch_offsets(offsets, plane, entities, tools, normal, number, corner_edges)
+    boundary_edges = tuple((name, edge) for name, edge in (*links, *detached, *offset_edges) if name not in off_plane)
+    mirror_edges, mirror_points, mirror_construction = (), (), frozenset()
+    if mirrors is not None:
+        from UI.model.sketch_mirror import rebuild_sketch_mirrors
+        reflected = rebuild_sketch_mirrors(mirrors, plane, entities, tools, normal,
+                                           (*boundary_edges, *corner_edges), named_points)
+        mirror_edges, mirror_points, mirror_construction = reflected.edges, reflected.points, reflected.construction
+        boundary_edges += tuple((name, edge) for name, edge in mirror_edges if name not in mirror_construction)
+    pattern_edges, pattern_points, pattern_construction = (), (), frozenset()
+    if patterns is not None:
+        from UI.model.sketch_pattern import rebuild_sketch_patterns
+        derived = {name: (edge, name in mirror_construction) for name, edge in
+                   (*boundary_edges, *corner_edges, *mirror_edges)}
+        points = {name: plane.from_local_coords((*point, 0)) for name, point in named_points.items()}
+        points.update(mirror_points)
+        pattern = rebuild_sketch_patterns(patterns, plane, entities, tools, normal, derived, points, number)
+        pattern_edges, pattern_points, pattern_construction = pattern.edges, pattern.points, pattern.construction
+        boundary_edges += tuple((name, edge) for name, edge in pattern_edges if name not in pattern_construction)
+    profiles = build_profiles(tools, normal, linked_edges=(edge for _, edge in (*boundary_edges, *corner_edges)))
     from UI.model.profile_identity import profile_keys
-    keys = profile_keys(profiles, entities, tools, np.asarray(tuple(plane.z_dir)))
-    return ParametricSketch(plane, tuple(profiles), solved, tuple(keys), tuple(tools))
+    keys = profile_keys(profiles, entities, tools, normal, boundary_edges, corner_edges, corner_sources)
+    return ParametricSketch(plane, tuple(profiles), solved, tuple(keys), tuple(tools), tuple(axis_segments),
+                            links, linked_points, detached, detached_points, tuple(entities),
+                            spatial_edges, frozenset(off_plane), offset_edges, corner_edges,
+                            mirror_edges, mirror_points, mirror_construction,
+                            pattern_edges, pattern_points, pattern_construction)

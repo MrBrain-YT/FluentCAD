@@ -303,6 +303,14 @@ def solve_constraints(points, radii, constraints, parameters=None, tolerance=1e-
                 result.extend((cross(u, delta), max(-along, 0.), max(along - np.linalg.norm(end - origin), 0.)))
             elif kind == 'point_on_circle':
                 center, radius = circle(e[1]); result.append(np.linalg.norm(p(e[0]) - center) - radius)
+            elif kind == 'point_on_arc':
+                center, radius = arc(e[1])
+                start, end, through = (p(name) for name in e[1])
+                chord = (end - start) / np.linalg.norm(end - start)
+                delta = p(e[0]) - start
+                side = math.copysign(1., cross(chord, through - start))
+                result.extend((np.linalg.norm(p(e[0]) - center) - radius,
+                               max(0., -side * cross(chord, delta))))
             elif kind == 'point_on_slot':
                 position, _, _ = contact_slot(e[1], e[2], target(c))
                 result.extend(p(e[0]) - position)

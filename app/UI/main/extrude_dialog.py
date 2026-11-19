@@ -1,5 +1,6 @@
 """Extrusion options and a reversible viewport preview."""
 from PySide6 import QtCore, QtWidgets
+import numpy as np
 from UI.model.ModelConverter import b123d_to_pro_mesh
 from UI.main.expression_spinbox import ExpressionSpinBox
 from UI.main.extrude_handle import ExtrudeHandle, MoveAxisHandles, ParameterHandles, CompositeHandles, create_operation_handles
@@ -9,7 +10,11 @@ class ExtrudeDialog(QtWidgets.QDialog):
     def __init__(self, manager, index, parent=None):
         super().__init__(parent)
         self.manager = manager
-        self.index = index
+        self.indices = tuple(index) if isinstance(index, (list, tuple)) else (index,)
+        self.index = self.indices[0]
+        self.target_selection = None
+        self.target_label = None
+        self.picking_geometry = False
         self.result_shape = None
         self.setWindowTitle('Extrude')
         self.setMinimumWidth(290)
@@ -23,6 +28,17 @@ class ExtrudeDialog(QtWidgets.QDialog):
         self.extent = QtWidgets.QComboBox()
         self.extent.addItem('Distance', 'distance')
         self.extent.addItem('Through all (Cut / Intersect)', 'all')
+        self.extent.addItem('To Object', 'to_object')
+        self.target = QtWidgets.QComboBox()
+        self.target.addItem('Face', 'face')
+        self.target.addItem('Body', 'body')
+        self.target.addItem('Plane', 'plane')
+        self.pick_target = QtWidgets.QPushButton('Select in scene')
+        self.pick_target.setAutoDefault(False)
+        self.target_plane = QtWidgets.QComboBox()
+        self.reverse = QtWidgets.QCheckBox('Flip direction')
+        self.profile_count = QtWidgets.QLabel()
+        self.profile_count.setToolTip('Click an area in the scene to add or remove it.')
         self.direction = QtWidgets.QComboBox()
         self.direction.addItem('One side', 'one')
         self.direction.addItem('Symmetric (distance per side)', 'symmetric')
@@ -34,7 +50,12 @@ class ExtrudeDialog(QtWidgets.QDialog):
         self.operation.addItem('Intersect', 'intersect')
         if getattr(manager, 'current_part', None) is not None:
             self.operation.setCurrentIndex(1)
+        form.addRow('Profiles', self.profile_count)
         form.addRow('Extent', self.extent)
+        form.addRow('Target type', self.target)
+        form.addRow('Target', self.pick_target)
+        form.addRow('Target plane', self.target_plane)
+        form.addRow(self.reverse)
         form.addRow('Distance', self.distance)
         form.addRow('Opposite distance', self.second_distance)
         form.addRow('Start offset', self.offset)
@@ -42,9 +63,10 @@ class ExtrudeDialog(QtWidgets.QDialog):
         form.addRow('Direction', self.direction)
         form.addRow('Operation', self.operation)
         layout.addLayout(form)
+        self.form = form
         self.message = QtWidgets.QLabel()
         self.message.setWordWrap(True)
-        self.message.setStyleSheet('color: #a23b32;')
+        self.message.setProperty('role', 'error')
         layout.addWidget(self.message)
         self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -52,11 +74,16 @@ class ExtrudeDialog(QtWidgets.QDialog):
         layout.addWidget(self.buttons)
         for control in (self.distance, self.second_distance, self.offset, self.taper):
             control.valueChanged.connect(self.request_preview)
-        self.extent.currentIndexChanged.connect(self.request_preview)
+        self.extent.currentIndexChanged.connect(self._target_mode_changed)
+        self.target.currentIndexChanged.connect(self._target_mode_changed)
+        self.target_plane.currentIndexChanged.connect(self.request_preview)
+        self.reverse.toggled.connect(self.request_preview)
+        self.pick_target.clicked.connect(self._toggle_target_picker)
         self.direction.currentIndexChanged.connect(self.request_preview)
         self.operation.currentIndexChanged.connect(self.request_preview)
         self.handle = None
         self.finished.connect(self.clear_preview)
+        self._update_profile_count()
         self.update_preview()
         try:
             self.handle = ExtrudeHandle(self)
@@ -85,24 +112,89 @@ class ExtrudeDialog(QtWidgets.QDialog):
         if not timer.isActive():
             timer.start()
 
-    def accept(self):
+    def flush_preview(self):
         timer = getattr(self, '_preview_timer', None)
-        if timer is not None and timer.isActive():
-            timer.stop()
-            self.update_preview()
+        if timer is None or not timer.isActive():
+            return False
+        timer.stop()
+        self.update_preview()
+        return True
+
+    def accept(self):
+        # Keyboard tracking is disabled, so apply the text before committing.
+        # Do not silently accept the previous value for an incomplete expression.
+        for field in self.findChildren(QtWidgets.QAbstractSpinBox):
+            if not field.isEnabled():
+                continue
+            if not field.hasAcceptableInput():
+                field.setFocus()
+                return
+            field.interpretText()
+        self.flush_preview()
         if self.result_shape is not None:
             super().accept()
 
     def update_preview(self, *args):
         is_distance = self.extent.currentData() == 'distance'
+        to_object = self.extent.currentData() == 'to_object'
+        use_plane = self.target.currentData() == 'plane'
+        self.form.setRowVisible(self.target, to_object)
+        self.form.setRowVisible(self.pick_target, to_object and not use_plane)
+        self.form.setRowVisible(self.target_plane, to_object and use_plane)
+        self.form.setRowVisible(self.reverse, to_object)
         self.distance.setEnabled(is_distance)
-        self.offset.setEnabled(is_distance)
+        self.offset.setEnabled(is_distance or to_object)
         self.taper.setEnabled(is_distance)
         self.direction.setEnabled(is_distance)
         self.second_distance.setEnabled(is_distance and self.direction.currentData() == 'two')
         self._update_common_preview()
-        if self.handle is not None:
-            self.handle.sync()
+        self._finish_preview()
+
+    def _target_mode_changed(self, *args):
+        self.picking_geometry = False
+        if not self.target_selection or self.target_selection['kind'] != self.target.currentData():
+            self.target_selection = None
+            self.target_label = None
+        self._update_target_button()
+        if self.extent.currentData() == 'to_object' and self.target.currentData() == 'plane' and not self.target_plane.count():
+            self.target_plane.addItem('Select a plane', None)
+            for label, selection in self.manager.extrusion_planes():
+                self.target_plane.addItem(label, selection)
+        self.request_preview()
+
+    def _toggle_target_picker(self):
+        self.picking_geometry = not self.picking_geometry
+        self._update_target_button()
+        self.update_preview()
+
+    def _update_target_button(self):
+        label = f'{self.target_label} · Change' if self.target_label else 'Select in scene'
+        self.pick_target.setText('Cancel selection' if self.picking_geometry else label)
+
+    def _update_profile_count(self):
+        self.profile_count.setText(f'{len(self.indices)} selected')
+
+    def scene_click(self):
+        if self.picking_geometry:
+            kind = self.target.currentData()
+            try:
+                self.target_selection, index = self.manager.pick_extrusion_target(kind)
+            except ValueError as exc:
+                self.message.setText(str(exc))
+                return
+            self.picking_geometry = False
+            self.target_label = f'Face {index + 1}' if kind == 'face' else f'Body at face {index + 1}'
+            self._update_target_button()
+            self.request_preview()
+            return
+        if self.manager._select_profile(toggle=True):
+            self.indices = self.manager.extrusion_profile_indices()
+            if self.indices:
+                self.index = self.indices[0]
+                if self.handle is not None:
+                    self.handle.anchor = np.array(tuple(self.manager.profiles[self.index]['face'].center()))
+            self._update_profile_count()
+            self.request_preview()
 
     def _update_common_preview(self):
         self.manager.plotter.remove_actor('extrude_preview', render=False)
@@ -110,6 +202,10 @@ class ExtrudeDialog(QtWidgets.QDialog):
         body = self.manager.plotter.actors.get('main_part')
         if body is not None:
             body.SetVisibility(True)
+        if getattr(self, 'picking_geometry', False):
+            self.message.setText(self.pick_instruction())
+            self.buttons.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+            return
         try:
             shape = self.build_shape()
             mesh = b123d_to_pro_mesh(shape, 0.01, 0.1)
@@ -123,14 +219,27 @@ class ExtrudeDialog(QtWidgets.QDialog):
         except Exception as exc:
             self.message.setText(str(exc))
         self.buttons.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(self.result_shape is not None)
+
+    def _finish_preview(self):
+        if self.handle is not None:
+            self.handle.sync(render=False)
         self.manager.plotter.render()
 
+    def pick_instruction(self):
+        return f'Click a face of the target {self.target.currentData()} in the scene.'
+
+    def extrusion_arguments(self):
+        extent = self.extent.currentData()
+        distance_mode = extent == 'distance'
+        target = self.target_plane.currentData() if self.target.currentData() == 'plane' else self.target_selection
+        return (self.indices, self.distance.value() if distance_mode else 0, self.operation.currentData(),
+                self.offset.value() if extent != 'all' else 0, self.taper.value() if distance_mode else 0,
+                distance_mode and self.direction.currentData() == 'symmetric',
+                self.second_distance.value() if distance_mode and self.direction.currentData() == 'two' else None,
+                extent, target if extent == 'to_object' else None, self.reverse.isChecked())
+
     def build_shape(self):
-        return self.manager.build_extrusion(
-            self.index, self.distance.value(), self.operation.currentData(),
-            self.offset.value(), self.taper.value(), self.direction.currentData() == 'symmetric',
-            self.second_distance.value() if self.direction.currentData() == 'two' else None,
-            self.extent.currentData())
+        return self.manager.build_extrusion(*self.extrusion_arguments())
 
     def clear_preview(self, *args):
         timer = getattr(self, '_preview_timer', None)
@@ -154,6 +263,9 @@ class RevolveDialog(ExtrudeDialog):
         self.index = index
         self.result_shape = None
         self.handle = None
+        self.picking_geometry = False
+        self.axis_selection = None
+        self.axis_label = None
         self.setWindowTitle('Revolve')
         self.setMinimumWidth(290)
         layout = QtWidgets.QVBoxLayout(self)
@@ -163,23 +275,30 @@ class RevolveDialog(ExtrudeDialog):
         self.axis = QtWidgets.QComboBox()
         self.axis.addItem('Sketch horizontal axis', 'horizontal')
         self.axis.addItem('Sketch vertical axis', 'vertical')
+        self.axis.addItem('Straight sketch line', 'sketch_line')
+        self.axis.addItem('Straight edge or cylindrical face', 'model_geometry')
+        self.pick_axis = QtWidgets.QPushButton('Select in scene')
+        self.pick_axis.setAutoDefault(False)
         self.operation = QtWidgets.QComboBox()
         for label, key in [('New body', 'new_body'), ('Join', 'join'), ('Cut', 'cut'), ('Intersect', 'intersect')]:
             self.operation.addItem(label, key)
         form.addRow('Axis', self.axis)
+        form.addRow('Geometry', self.pick_axis)
         form.addRow('Angle', self.angle)
         form.addRow('Operation', self.operation)
         layout.addLayout(form)
+        self.form = form
         self.message = QtWidgets.QLabel()
         self.message.setWordWrap(True)
-        self.message.setStyleSheet('color: #a23b32;')
+        self.message.setProperty('role', 'error')
         layout.addWidget(self.message)
         self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         self.angle.valueChanged.connect(self.request_preview)
-        self.axis.currentIndexChanged.connect(self.request_preview)
+        self.axis.currentIndexChanged.connect(self._axis_mode_changed)
+        self.pick_axis.clicked.connect(self._toggle_axis_picker)
         self.operation.currentIndexChanged.connect(self.request_preview)
         self.finished.connect(self.clear_preview)
         self.update_preview()
@@ -189,13 +308,62 @@ class RevolveDialog(ExtrudeDialog):
             self.handle = None
 
     def build_shape(self):
-        return self.manager.build_revolution(self.index, self.axis.currentData(),
+        return self.manager.build_revolution(self.index, self.current_axis(),
                                              self.angle.value(), self.operation.currentData())
 
+    def current_axis(self):
+        mode = self.axis.currentData()
+        return mode if mode in ('horizontal', 'vertical') else self.axis_selection
+
+    def _axis_mode_changed(self, *args):
+        self.axis_selection = self.axis_label = None
+        self.picking_geometry = False
+        self._show_sketch_lines()
+        self.request_preview()
+
+    def _show_sketch_lines(self):
+        self.manager.plotter.remove_actor('revolve_axis_candidates', render=False)
+        if self.picking_geometry and self.axis.currentData() == 'sketch_line':
+            segments = self.manager.sketch_axis_segments(self.index)
+            if segments:
+                points = np.array([point for _, segment in segments for point in segment])
+                self.manager.plotter.add_lines(points, name='revolve_axis_candidates', color='#f39c12', width=3)
+
+    def _toggle_axis_picker(self):
+        self.picking_geometry = not self.picking_geometry
+        self._show_sketch_lines()
+        self.update_preview()
+
+    def pick_instruction(self):
+        if self.axis.currentData() == 'sketch_line':
+            return 'Click a highlighted straight line in the sketch.'
+        return 'Click a straight model edge or a cylindrical face.'
+
+    def scene_click(self):
+        if not self.picking_geometry:
+            return
+        try:
+            self.axis_selection, self.axis_label = self.manager.pick_revolution_axis(
+                self.index, self.axis.currentData() == 'sketch_line')
+        except ValueError as exc:
+            self.message.setText(str(exc))
+            return
+        self.picking_geometry = False
+        self._show_sketch_lines()
+        self.request_preview()
+
+    def clear_preview(self, *args):
+        self.manager.plotter.remove_actor('revolve_axis_candidates', render=False)
+        super().clear_preview(*args)
+
     def update_preview(self, *args):
+        custom = self.axis.currentData() in ('sketch_line', 'model_geometry')
+        self.form.setRowVisible(self.pick_axis, custom)
+        label = f'{self.axis_label} · Change' if self.axis_label else 'Select in scene'
+        self.pick_axis.setText('Cancel selection' if self.picking_geometry else label)
+        self.angle.setEnabled(not self.picking_geometry and self.current_axis() is not None)
         self._update_common_preview()
-        if self.handle is not None:
-            self.handle.sync()
+        self._finish_preview()
 
 class PrimitiveDialog(ExtrudeDialog):
     """A centered solid primitive with a live preview."""
@@ -231,7 +399,7 @@ class PrimitiveDialog(ExtrudeDialog):
         layout.addLayout(form)
         self.message = QtWidgets.QLabel()
         self.message.setWordWrap(True)
-        self.message.setStyleSheet('color: #a23b32;')
+        self.message.setProperty('role', 'error')
         layout.addWidget(self.message)
         self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -256,8 +424,7 @@ class PrimitiveDialog(ExtrudeDialog):
 
     def update_preview(self, *args):
         self._update_common_preview()
-        if self.handle is not None:
-            self.handle.sync()
+        self._finish_preview()
 
 
 class TransformDialog(ExtrudeDialog):
@@ -335,7 +502,7 @@ class TransformDialog(ExtrudeDialog):
         layout.addLayout(form)
         self.message = QtWidgets.QLabel()
         self.message.setWordWrap(True)
-        self.message.setStyleSheet('color: #a23b32;')
+        self.message.setProperty('role', 'error')
         layout.addWidget(self.message)
         self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -383,8 +550,7 @@ class TransformDialog(ExtrudeDialog):
 
     def update_preview(self, *args):
         self._update_common_preview()
-        if self.handle is not None:
-            self.handle.sync()
+        self._finish_preview()
 
 
 class SolidFeatureDialog(ExtrudeDialog):
@@ -451,7 +617,7 @@ class SolidFeatureDialog(ExtrudeDialog):
         layout.addLayout(form)
         self.message = QtWidgets.QLabel()
         self.message.setWordWrap(True)
-        self.message.setStyleSheet('color: #a23b32;')
+        self.message.setProperty('role', 'error')
         layout.addWidget(self.message)
         self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
@@ -506,5 +672,4 @@ class SolidFeatureDialog(ExtrudeDialog):
         if self.kind == 'hole':
             self.controls['depth'].setEnabled(not self.controls['through'].isChecked())
         self._update_common_preview()
-        if self.handle is not None:
-            self.handle.sync()
+        self._finish_preview()

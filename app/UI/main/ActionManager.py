@@ -6,4 +6,6 @@ class ActionManagerUI:
         self.tool_tabs_widgets = tool_tabs_widgets
     
     def activate_scetch_mode(self, tool_tabs:QtWidgets.QTabWidget, tab_name:str) -> None:
-        tool_tabs.setCurrentWidget(self.tool_tabs_widgets[tab_name])
+        widget = self.tool_tabs_widgets[tab_name]
+        tool_tabs.setTabVisible(tool_tabs.indexOf(widget), True)
+        tool_tabs.setCurrentWidget(widget)

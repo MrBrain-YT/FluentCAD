@@ -1,5 +1,6 @@
 """Safe point dragging for named-point parametric sketches."""
 from copy import deepcopy
+from dataclasses import replace
 import numpy as np
 from UI.model.feature_graph import FeatureGraph
 from UI.model.parametric_sketch import circle_radius_name
@@ -46,6 +47,71 @@ def move_sketch_point(graph, feature_id, point_name, position):
     return result
 
 
+def sketch_transform(translation, angle):
+    delta = np.asarray(translation, dtype=float)
+    if delta.shape != (2,) or not np.isfinite(delta).all() or not np.isfinite(angle):
+        raise ValueError('Translation and rotation must be finite.')
+    theta = np.radians(angle)
+    rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    return lambda point: (rotation @ point + delta).tolist()
+
+
+def rotate_sketch_ellipse(entity, angle):
+    if entity['type'] == 'ellipse' and angle:
+        existing = entity.get('rotation', 0)
+        entity['rotation'] = f'({existing}) + ({angle})' if isinstance(existing, str) else existing + angle
+
+
+def move_sketch_points(graph, feature_id, point_names, translation, angle=0, *, entities=()):
+    """Transform named points together while solving the existing constraints."""
+    feature = next((item for item in graph.features if item.id == feature_id), None)
+    if feature is None or feature.kind != 'planar_sketch' or feature_id not in graph.results:
+        raise ValueError('Choose an active parametric sketch.')
+    names = tuple(dict.fromkeys(point_names))
+    state = graph.results[feature_id].constraint_status
+    if state is None or not names or any(name not in state.points for name in names):
+        raise ValueError('Choose named sketch points to move.')
+    transform = sketch_transform(translation, angle)
+    params = deepcopy(feature.parameters)
+    for index in entities:
+        rotate_sketch_ellipse(params['entities'][index], angle)
+    targets = {name: transform(state.points[name]) for name in names}
+    radii = {index: state.radii[circle_radius_name(index)] for index in entities
+             if params['entities'][index]['type'] == 'circle'}
+    return solve_sketch_transform(graph, feature_id, params, targets, radii)
+
+
+def solve_sketch_transform(graph, feature_id, params, targets, radii, *, reseeded=False):
+    state = graph.results[feature_id].constraint_status
+    temporary = deepcopy(params)
+    for name, target in targets.items():
+        temporary.setdefault('constraints', []).append({
+            'kind': 'fixed', 'entities': [name], 'value': target,
+        })
+    for index, value in radii.items():
+        entity = params['entities'][index]
+        temporary.setdefault('constraints', []).append({
+            'kind': 'radius', 'entities': [[entity['center'], circle_radius_name(index)]], 'value': float(value),
+        })
+    features = graph.features
+    def rebuild(parameters):
+        return FeatureGraph((replace(item, parameters=parameters) if item.id == feature_id else item
+                             for item in features), graph.parameters)
+    probe = rebuild(temporary)
+    before = state
+    if reseeded:
+        before = replace(state, points={**state.points, **targets},
+                         radii={**state.radii, **{circle_radius_name(i): r for i, r in radii.items()}})
+    _apply_solution(params, before, probe.results[feature_id].constraint_status)
+    result = rebuild(params)
+    final = result.results[feature_id].constraint_status
+    if any(np.linalg.norm(final.points[name] - target) > 1e-6 for name, target in targets.items()):
+        raise ValueError('The sketch constraints prevent the requested transform.')
+    if any(abs(final.radii[circle_radius_name(index)] - value) > 1e-6 for index, value in radii.items()):
+        raise ValueError('The sketch constraints prevent the requested radius.')
+    return result
+
+
 def set_circle_radius(graph, feature_id, entity_index, radius):
     feature = next((item for item in graph.features if item.id == feature_id), None)
     if feature is None or feature.kind != 'planar_sketch':
@@ -74,14 +140,14 @@ def set_circle_radius(graph, feature_id, entity_index, radius):
 
 
 def add_sketch_constraint(graph, feature_id, constraint):
-    feature = next((item for item in graph.features if item.id == feature_id), None)
+    features = graph.features
+    feature = next((item for item in features if item.id == feature_id), None)
     if feature is None or feature.kind != 'planar_sketch':
         raise ValueError('Choose a parametric sketch.')
     params = deepcopy(feature.parameters)
     params.setdefault('constraints', []).append(deepcopy(constraint))
-    result = FeatureGraph.from_data(graph.to_data())
-    result.edit(feature_id, parameters=params)
-    return result
+    return FeatureGraph((replace(item, parameters=params) if item.id == feature_id else item
+                         for item in features), graph.parameters)
 
 
 def remove_sketch_constraint(graph, feature_id, index):

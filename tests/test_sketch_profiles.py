@@ -28,7 +28,8 @@ from UI.model.transforms import move_copy, scale_model, mirror_model, rectangula
 from UI.model.surface_operations import fillet_all, chamfer_all, shell_face, offset_solid, hole_at_face_center, fillet_edges, chamfer_edges
 from UI.model.edge_selection import nearest_screen_edge, face_edge_indices
 from UI.main.content import LayoutManager
-from UI.main.extrude_handle import world_per_pixel, ExtrudeHandle, MoveAxisHandles, ParameterHandles, OperationHandle, projected_ring_angle, projected_axis_delta
+from UI.main.parametric_operations import commit_parametric_operation
+from UI.main.extrude_handle import world_per_pixel, ExtrudeHandle, MoveAxisHandles, ParameterHandles, OperationHandle, CompositeHandles, projected_ring_angle, projected_axis_delta, update_handle_line, remove_handle_line
 from UI.model.tools.StraightShape import shape_points
 from UI.model.tools.PointCircle import circle_from_points
 from UI.model.tools.Slot import slot_edges, normalize_slot_points
@@ -81,7 +82,7 @@ class GridAndShapesTest(unittest.TestCase):
         manager.activated_sketch_id = 1
         manager.sketchs_data[1] = {"sketch_func": []}
         class Plotter:
-            camera = SimpleNamespace(parallel_scale=5.)
+            camera = SimpleNamespace(parallel_scale=5., focal_point=(2., 3., 4.))
             def remove_actor(self, name): pass
             def add_mesh(self, mesh, **kwargs): self.mesh = mesh
         manager.plotter = Plotter()
@@ -118,6 +119,16 @@ class GridAndShapesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             manager.set_grid_step(0)
         self.assertEqual(manager.grid_step, 0.5)
+
+    def test_grid_follows_a_panned_sketch_view_along_the_original_lattice(self):
+        manager = self.manager()
+        manager.plotter.camera.focal_point = (101.2, -57.6, 4.)
+        manager.update_grid_lod()
+        points = manager.plotter.mesh.points
+        center = (points.min(axis=0) + points.max(axis=0)) / 2
+        np.testing.assert_allclose(center, (101., -58., 4.))
+        snapped, _ = manager.get_snapped_pos(np.array([101.03, -57.97, 4.]))
+        np.testing.assert_allclose(snapped, center)
 
     def test_rectangle_and_polygon_make_profiles(self):
         center = np.zeros(3)
@@ -259,6 +270,41 @@ class SelectionTest(unittest.TestCase):
 
 
 class ExtrusionOperationsTest(unittest.TestCase):
+    def test_to_object_stops_on_planar_face_or_first_body_boundary(self):
+        profile = Face.make_rect(2, 2)
+        body = Box(6, 6, 4).moved(Pos(0, 0, 6))
+        near = min(body.faces(), key=lambda face: face.center().Z)
+        far = max(body.faces(), key=lambda face: face.center().Z)
+        normal = (0, 0, 1)
+        near_result = build_extrusion(profile, normal, 0, extent='to_object', target=body)
+        far_result = build_extrusion(profile, normal, 0, extent='to_object', target=far)
+        self.assertAlmostEqual(near_result.bounding_box().max.Z, 4)
+        self.assertAlmostEqual(far_result.bounding_box().max.Z, 8)
+        inside = profile.moved(Pos(0, 0, 6))
+        reverse = build_extrusion(inside, normal, 0, extent='to_object', target=body, reverse=True)
+        self.assertAlmostEqual(reverse.bounding_box().min.Z, 4)
+        self.assertAlmostEqual(reverse.volume, 8)
+        with self.assertRaisesRegex(ValueError, 'entire end'):
+            build_extrusion(profile.moved(Pos(2.5, 0, 0)), normal, 0, extent='to_object', target=near)
+
+    def test_to_object_inclined_plane_clips_all_profiles(self):
+        profile = Face.make_rect(2, 2)
+        target = Plane((0, 0, 5), z_dir=(0.25, 0, 1))
+        profiles = [profile.moved(Pos(x, 0, 0)) for x in (-3, 3)]
+        result = build_extrusion(profiles, (0, 0, 1), 0, extent='to_object', target=target)
+        self.assertEqual(len(result.solids()), 2)
+        self.assertAlmostEqual(result.volume, 40)
+        self.assertAlmostEqual(target.to_local_coords(result).bounding_box().max.Z, 0)
+
+    def test_to_object_uses_curved_target_face_for_the_cap(self):
+        profile = Face.make_rect(2, 2)
+        cylinder = Cylinder(4, 8).moved(Rot(90, 0, 0)).moved(Pos(0, 0, 8))
+        face = next(item for item in cylinder.faces() if item.geom_type.name == 'CYLINDER')
+        result = build_extrusion(profile, (0, 0, 1), 0, extent='to_object', target=(cylinder, face))
+        self.assertTrue(any(item.geom_type.name == 'CYLINDER' for item in result.faces()))
+        self.assertGreater(result.volume, 16)
+        self.assertLess(result.volume, 17)
+
     def setUp(self):
         self.body = Box(4, 4, 4, align=(Align.CENTER, Align.CENTER, Align.MIN))
         self.face = Face.make_rect(2, 2, Plane(origin=(0, 0, 4)))
@@ -1110,6 +1156,7 @@ class ExtrusionHandleTest(unittest.TestCase):
         self.assertAlmostEqual(projected_axis_delta((0, 0), (50, 20), (0, 0), (-100, 0), 2), -1)
         self.assertAlmostEqual(projected_axis_delta((0, 0), (10, 10), (0, 0), (20, 20), 4), 2)
         self.assertEqual(projected_axis_delta((0, 0), (10, 10), (0, 0), (1, 1), 4), 0)
+        self.assertAlmostEqual(projected_axis_delta((0, 0), (10, 0), (0, 0), (4, 0), 2), .2)
 
     def test_scale_follows_zoom_and_projection(self):
         camera = SimpleNamespace(GetParallelProjection=lambda: True, GetParallelScale=lambda: 10.)
@@ -1119,6 +1166,8 @@ class ExtrusionHandleTest(unittest.TestCase):
         camera = SimpleNamespace(GetParallelProjection=lambda: False, position=(0, 0, 10),
             focal_point=(0, 0, 0), GetViewAngle=lambda: 90.)
         self.assertAlmostEqual(world_per_pixel(camera, 1000), .02)
+        self.assertAlmostEqual(world_per_pixel(camera, 1000, (0, 0, 5)), .01)
+        self.assertAlmostEqual(world_per_pixel(camera, 1000, (0, 0, -10)), .04)
 
     def test_drag_updates_numeric_field(self):
         handle = ExtrudeHandle.__new__(ExtrudeHandle)
@@ -1161,16 +1210,41 @@ class ExtrusionHandleTest(unittest.TestCase):
         handle.updating = False
         handle.sync()
         handle.widgets['opposite'].SetEnabled.assert_called_with(True)
-        handle.representations['opposite'].SetWorldPosition.assert_called_with((-5., 0., 0.))
+        self.assertLess(handle.representations['opposite'].SetWorldPosition.call_args.args[0][0], -5.)
         mode[0] = 'symmetric'
         handle.sync()
-        handle.representations['opposite'].SetWorldPosition.assert_called_with((-3., 0., 0.))
+        self.assertLess(handle.representations['opposite'].SetWorldPosition.call_args.args[0][0], -3.)
         mode[0] = 'one'
         handle.sync()
         handle.widgets['opposite'].SetEnabled.assert_called_with(False)
+        mode[0] = 'two'
+        handle.dialog.distance.value = lambda: 0.
+        handle.dialog.second_distance.value = lambda: 0.
+        handle.sync()
+        first = np.asarray(handle.representations['primary'].SetWorldPosition.call_args.args[0])
+        second = np.asarray(handle.representations['opposite'].SetWorldPosition.call_args.args[0])
+        self.assertGreater(first[0], 0.)
+        self.assertLess(second[0], 0.)
 
 
 class MoveHandleTest(unittest.TestCase):
+    def test_control_toggles_multiple_selected_faces(self):
+        manager = ActionManager(None)
+        import pyvista as pv
+        mesh = pv.Plane(i_resolution=1, j_resolution=1).triangulate()
+        mesh.cell_data['face_id'] = [0, 1]
+        manager.plotter = SimpleNamespace(actors={'main_part': SimpleNamespace(mapper=SimpleNamespace(dataset=mesh))})
+        manager._select_profile = Mock(return_value=False)
+        manager._pick_face = Mock(side_effect=[(0, mesh), (1, mesh), (1, mesh)])
+        manager.control_modifier_active = Mock(side_effect=[False, True, True])
+        manager._draw_highlight = Mock()
+        manager._on_click()
+        manager._on_click()
+        self.assertEqual(manager.selected_face_ids, {0, 1})
+        manager._on_click()
+        self.assertEqual(manager.selected_face_ids, {0})
+        self.assertEqual(manager.selected_face_id, 0)
+
     def test_each_axis_updates_only_its_translation_field(self):
         camera = SimpleNamespace(GetParallelProjection=lambda: True, GetParallelScale=lambda: 10.)
         plotter = SimpleNamespace(camera=camera, iren=SimpleNamespace(get_event_position=lambda: (0, 150)),
@@ -1194,6 +1268,26 @@ class MoveHandleTest(unittest.TestCase):
 
 
 class RotationAndScaleHandleTest(unittest.TestCase):
+    def test_composite_renders_once_for_all_handles(self):
+        plotter = SimpleNamespace(render=Mock())
+        first = SimpleNamespace(plotter=plotter, sync=Mock())
+        second = SimpleNamespace(plotter=plotter, sync=Mock())
+        CompositeHandles(first, second).sync()
+        first.sync.assert_called_once_with(render=False)
+        second.sync.assert_called_once_with(render=False)
+        plotter.render.assert_called_once()
+
+    def test_ring_mesh_is_reused_and_removed(self):
+        plotter = SimpleNamespace(add_mesh=Mock(), remove_actor=Mock())
+        update_handle_line(plotter, 'ring', [(0, 0, 0), (1, 0, 0)], '#fff')
+        original = plotter._fluent_handle_lines['ring']
+        update_handle_line(plotter, 'ring', [(0, 0, 0), (2, 0, 0)], '#fff')
+        self.assertIs(plotter._fluent_handle_lines['ring'], original)
+        self.assertEqual(plotter.add_mesh.call_count, 1)
+        np.testing.assert_allclose(original.points[1], (2, 0, 0))
+        remove_handle_line(plotter, 'ring')
+        self.assertNotIn('ring', plotter._fluent_handle_lines)
+
     def test_projected_ring_angle_and_edge_on(self):
         self.assertAlmostEqual(projected_ring_angle((0, 20), (0, 0), (10, 0), (0, 20)), 90)
         self.assertAlmostEqual(projected_ring_angle((-10, 0), (0, 0), (10, 0), (0, 20)), 180)
@@ -1236,6 +1330,30 @@ class OperationHandleTest(unittest.TestCase):
         handle.drag()
         handle.field.setValue.assert_called_once_with(30.)
 
+    def test_rotation_continues_through_full_turn_and_reverses(self):
+        handle = OperationHandle.__new__(OperationHandle)
+        handle.plotter = SimpleNamespace(iren=SimpleNamespace(get_event_position=lambda: (0, 0)))
+        handle.field, handle.angle = SimpleNamespace(setValue=Mock()), True
+        handle.drag_start, handle.updating, handle.sync = ((0, 0), 0., 0., None), False, Mock()
+        handle.cursor_angle = Mock(side_effect=[90., 179., -90., 0., -90.])
+        for _ in range(5):
+            handle.drag()
+        self.assertEqual([call.args[0] for call in handle.field.setValue.call_args_list],
+                         [90., 179., 270., 360., 270.])
+
+    def test_ring_keeps_value_when_projection_temporarily_disappears(self):
+        handle = OperationHandle.__new__(OperationHandle)
+        cursor = [(0, 0)]
+        handle.plotter = SimpleNamespace(iren=SimpleNamespace(get_event_position=lambda: cursor[0]))
+        handle.field, handle.angle = SimpleNamespace(setValue=Mock()), True
+        handle.drag_start, handle.updating, handle.sync = ((0, 0), 0., 0., None), False, Mock()
+        handle.cursor_angle = Mock(side_effect=[20., None, 80., 90.])
+        for pos in [(0, 0), (0, 10), (0, 10), (0, 10)]:
+            cursor[0] = pos
+            handle.drag()
+        self.assertEqual([call.args[0] for call in handle.field.setValue.call_args_list],
+                         [20., 25., 25., 35.])
+
     def test_close_disables_widget_and_removes_actor(self):
         handle = OperationHandle.__new__(OperationHandle)
         handle.widget = SimpleNamespace(EnabledOff=Mock(), RemoveAllObservers=Mock())
@@ -1248,6 +1366,100 @@ class OperationHandleTest(unittest.TestCase):
 
 
 class TimelineTest(unittest.TestCase):
+    def test_body_visibility_rejects_ambiguous_references(self):
+        from UI.model.body_visibility import describe_body, resolve_body_reference
+        body = Box(2, 2, 2)
+        reference = describe_body(body)
+        with self.assertRaises(ValueError):
+            resolve_body_reference(reference, [body, body])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'visible.fcad'
+            settings = {'hidden_bodies': [], 'hidden_body_refs': [reference], 'visible_planes': [], 'visible_sketch': None}
+            save_snapshot(path, body, [], [], visibility=settings)
+            self.assertEqual(load_snapshot(path, include_visibility=True)[-1], settings)
+
+    def test_snapshot_preserves_visibility_and_defaults_for_old_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'visibility.fcad'
+            state = {'hidden_bodies': [1], 'visible_planes': [0], 'visible_sketch': 'sketch-id'}
+            save_snapshot(path, Box(2, 2, 2), [], [], visibility=state)
+            self.assertEqual(load_snapshot(path, include_visibility=True)[-1], state)
+            save_snapshot(path, Box(2, 2, 2), [], [])
+            self.assertIsNone(load_snapshot(path, include_visibility=True)[-1])
+
+    def test_parametric_hole_and_shell_target_only_selected_body(self):
+        from UI.model.transforms import body_index_for_face
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [4, 4, 4]})
+        pattern = Feature.create('Pattern', 'rectangular_pattern', {'count_x': 'n', 'count_y': 1, 'spacing_x': 8, 'spacing_y': 8}, box.id)
+        graph = FeatureGraph([box, pattern], {'n': 2})
+        shape = graph.results[pattern.id]
+        face_index = next(i for i, face in enumerate(shape.faces())
+                          if body_index_for_face(shape, i) == 1 and face.normal_at().Z > .9)
+        for kind in ('hole', 'shell'):
+            controls = {'value': SimpleNamespace(value=lambda: -.25),
+                        'diameter': SimpleNamespace(value=lambda: 1.), 'depth': SimpleNamespace(value=lambda: 2.),
+                        'offset_u': SimpleNamespace(value=lambda: 0.), 'offset_v': SimpleNamespace(value=lambda: 0.),
+                        'through': SimpleNamespace(isChecked=lambda: False)}
+            dialog = SimpleNamespace(kind=kind, controls=controls, face_index=face_index,
+                scope=SimpleNamespace(currentData=lambda: 'selected'), windowTitle=lambda: kind)
+            manager = SimpleNamespace(parametric_graph=graph, selected_face_id=face_index, install_parametric_graph=Mock())
+            commit_parametric_operation(manager, dialog)
+            candidate = manager.install_parametric_graph.call_args.args[0]
+            result = candidate.results[candidate.features[-1].id]
+            self.assertEqual(len(result.solids()), 2)
+            self.assertAlmostEqual(max(body.volume for body in result.solids()), 64., places=5)
+            self.assertLess(min(body.volume for body in result.solids()), 64.)
+            candidate.set_parameters({'n': 3})
+            rebuilt = candidate.results[candidate.features[-1].id]
+            self.assertEqual(len(rebuilt.solids()), 3)
+            self.assertEqual(sum(body.volume < 63.999 for body in rebuilt.solids()), 1)
+    def test_parametric_move_targets_referenced_body(self):
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [2, 2, 2]})
+        pattern = Feature.create('Pattern', 'rectangular_pattern', {'count_x': 2, 'count_y': 1, 'spacing_x': 5, 'spacing_y': 5}, box.id)
+        graph = FeatureGraph([box, pattern])
+        shape = graph.results[pattern.id]
+        from UI.model.transforms import body_index_for_face
+        face_index = next(i for i, _ in enumerate(shape.faces()) if body_index_for_face(shape, i) == 1)
+        controls = {prefix + axis: SimpleNamespace(value=lambda v=v: v)
+                    for prefix, values in [('d', (0, 3, 0)), ('r', (0, 0, 0)), ('p', (0, 0, 0))]
+                    for axis, v in zip('XYZ', values)}
+        controls['copy'] = SimpleNamespace(isChecked=lambda: False)
+        dialog = SimpleNamespace(kind='move', controls=controls, scope=SimpleNamespace(currentData=lambda: 'selected'),
+                                 windowTitle=lambda: 'Move')
+        manager = SimpleNamespace(parametric_graph=graph, selected_face_id=face_index, install_parametric_graph=Mock())
+        commit_parametric_operation(manager, dialog)
+        candidate = manager.install_parametric_graph.call_args.args[0]
+        moved = candidate.results[candidate.features[-1].id]
+        self.assertEqual(sorted(round(s.center().Y, 4) for s in moved.solids()), [0., 3.])
+    def test_scene_move_is_recorded_as_rebuildable_feature(self):
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [4, 4, 4]})
+        graph = FeatureGraph([box])
+        controls = {prefix + axis: SimpleNamespace(value=lambda v=v: v)
+                    for prefix, values in [('d', (3, 0, 0)), ('r', (0, 0, 0)), ('p', (0, 0, 0))]
+                    for axis, v in zip('XYZ', values)}
+        controls['copy'] = SimpleNamespace(isChecked=lambda: False)
+        dialog = SimpleNamespace(kind='move', controls=controls, scope=SimpleNamespace(currentData=lambda: 'all'),
+                                 windowTitle=lambda: 'Move')
+        manager = SimpleNamespace(parametric_graph=graph, install_parametric_graph=Mock())
+        commit_parametric_operation(manager, dialog)
+        candidate = manager.install_parametric_graph.call_args.args[0]
+        self.assertEqual(candidate.features[-1].kind, 'move')
+        self.assertEqual(candidate.features[-1].input_id, box.id)
+        self.assertAlmostEqual(candidate.results[candidate.features[-1].id].center().X, 3.)
+
+    def test_scene_fillet_preserves_edge_reference_in_history(self):
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [4, 4, 4]})
+        graph = FeatureGraph([box])
+        dialog = SimpleNamespace(kind='fillet_selected', controls={'value': SimpleNamespace(value=lambda: .25)},
+                                 edge_indices=[0], scope=None, windowTitle=lambda: 'Fillet')
+        manager = SimpleNamespace(parametric_graph=graph, install_parametric_graph=Mock())
+        commit_parametric_operation(manager, dialog)
+        candidate = manager.install_parametric_graph.call_args.args[0]
+        feature = candidate.features[-1]
+        self.assertEqual(feature.kind, 'fillet')
+        self.assertEqual(feature.parameters['edges'][0]['kind'], 'edge')
+        self.assertTrue(candidate.results[feature.id].is_valid)
+
     def test_undo_redo_and_branch_truncation(self):
         timeline = Timeline()
         timeline.append('Box', {'Width': 10.})
@@ -1339,6 +1551,165 @@ class ParametricFeatureGraphTest(unittest.TestCase):
 
 
 class ParametricSketchChainTest(unittest.TestCase):
+    def test_extrude_selected_face_to_target_plane_in_parametric_model(self):
+        body = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [2, 2, 2]})
+        target = Feature.create('Target', 'datum_plane', {'origin': [0, 0, 'height']})
+        manager = ActionManager(None)
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.install_parametric_graph(FeatureGraph([body, target], {'height': 5}))
+        manager.selected_face_id = max(enumerate(manager.current_part.faces()), key=lambda pair: pair[1].center().Z)[0]
+        self.assertTrue(manager.prepare_selected_face_profile())
+        settings = dict(extent='to_object', target={'kind': 'plane', 'feature_id': target.id})
+        extrusion = manager.commit_parametric_extrusion(manager.extrusion_profile_indices(), 0, **settings)
+        self.assertAlmostEqual(manager.current_part.volume, 24)
+        graph = FeatureGraph.from_data(manager.parametric_graph.to_data())
+        graph.set_parameters({'height': 7})
+        self.assertAlmostEqual(graph.results[extrusion].volume, 32)
+
+    def test_multi_profile_extrusion_to_plane_rebuilds_and_roundtrips(self):
+        support = Feature.create('Support', 'datum_plane', {})
+        target = Feature.create('Target', 'datum_plane', {'origin': [0, 0, 'height']})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'left': [-3, 0], 'right': [3, 0]},
+            'entities': [
+                {'type': 'circle', 'center': 'left', 'radius': 'radius'},
+                {'type': 'circle', 'center': 'right', 'radius': 1},
+            ],
+        }, support.id)
+        manager = ActionManager(None)
+        graph = FeatureGraph([support, target, sketch], {'height': 5, 'radius': 1})
+        manager.plotter = SimpleNamespace(remove_actor=Mock(), render=Mock())
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.install_parametric_graph(graph)
+        manager.profiles = [
+            {'face': face, 'sketch_id': sketch.id, 'profile_index': i, 'name': f'profile_{i}'}
+            for i, face in enumerate(graph.results[sketch.id].profiles)
+        ]
+        args = dict(extent='to_object', target={'kind': 'plane', 'feature_id': target.id})
+        preview = manager.build_extrusion((0, 1), 0, **args)
+        extrusion = manager.commit_parametric_extrusion((0, 1), 0, **args)
+        self.assertEqual(len(manager.current_part.solids()), 2)
+        self.assertAlmostEqual(manager.current_part.volume, preview.volume)
+        self.assertAlmostEqual(manager.current_part.volume, 10 * math.pi)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'multi-extrude.fcad'
+            save_snapshot(path, manager.current_part, [], [], feature_graph=manager.parametric_graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            restored.set_parameters({'height': 7, 'radius': 1.5})
+            self.assertAlmostEqual(restored.results[extrusion].volume, 7 * 3.25 * math.pi)
+            restored.edit(target.id, suppressed=True)
+            self.assertIn(extrusion, restored.blocked)
+            restored.edit(target.id, suppressed=False)
+            self.assertEqual(len(restored.results[extrusion].solids()), 2)
+
+    def test_revolution_follows_named_sketch_segment(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'points': {'center': [3, 0], 'start': ['axis_x', -4], 'end': ['axis_x', 4]},
+            'entities': [
+                {'type': 'circle', 'center': 'center', 'radius': 1},
+                {'type': 'line', 'points': ['start', 'end'], 'construction': True},
+            ],
+        }, plane.id)
+        manager = ActionManager(None)
+        graph = FeatureGraph([plane, sketch], {'axis_x': 0})
+        manager.plotter = SimpleNamespace(remove_actor=Mock())
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.install_parametric_graph(graph)
+        manager.profiles = [{'face': graph.results[sketch.id].profiles[0], 'sketch_id': sketch.id, 'profile_index': 0}]
+        axis, _ = manager.sketch_axis_segments(0)[0]
+        preview = manager.build_revolution(0, axis, 360)
+        revolution = manager.commit_parametric_revolution(0, axis, 360)
+        self.assertAlmostEqual(manager.current_part.volume, preview.volume)
+        self.assertAlmostEqual(manager.current_part.volume, 6 * math.pi ** 2)
+        restored = FeatureGraph.from_data(manager.parametric_graph.to_data())
+        restored.set_parameters({'axis_x': 1})
+        self.assertAlmostEqual(restored.results[revolution].volume, 4 * math.pi ** 2)
+
+    def test_revolution_follows_selected_cylindrical_axis(self):
+        body = Feature.create('Shaft', 'primitive', {
+            'type': 'cylinder', 'dimensions': [0.5, 3], 'position': ['axis_x', 0, 0],
+        })
+        plane = Feature.create('XZ', 'datum_plane', {'normal': [0, 1, 0], 'x_dir': [1, 0, 0]})
+        sketch = Feature.create('Profile', 'planar_sketch', {
+            'entities': [{'type': 'circle', 'center': [3, 0], 'radius': 1}],
+        }, plane.id)
+        manager = ActionManager(None)
+        graph = FeatureGraph([body, plane, sketch], {'axis_x': 0})
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.install_parametric_graph(graph)
+        manager.profiles = [{'face': graph.results[sketch.id].profiles[0], 'sketch_id': sketch.id, 'profile_index': 0}]
+        face_index = next(i for i, face in enumerate(manager.current_part.faces()) if face.geom_type.name == 'CYLINDER')
+        manager._edge_at_cursor = Mock(return_value=None)
+        manager._get_face_under_mouse = Mock(return_value=(face_index, None))
+        selection, _ = manager.pick_revolution_axis(0, sketch_line=False)
+        revolve_id = manager.commit_parametric_revolution(0, selection, 360)
+        restored = FeatureGraph.from_data(manager.parametric_graph.to_data())
+        restored.set_parameters({'axis_x': 1})
+        volume = restored.results[revolve_id].volume - restored.results[body.id].volume
+        self.assertAlmostEqual(volume, 4 * math.pi ** 2)
+
+    def test_scene_revolution_preserves_bodies_and_follows_sketch_axis(self):
+        base = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [2, 2, 2], 'position': [50, 0, 0]})
+        plane = Feature.create('Plane', 'datum_plane', {'origin': ['position', 0, 0]})
+        sketch = Feature.create('Sketch', 'planar_sketch', {
+            'entities': [{'type': 'circle', 'center': [3, 0], 'radius': 1}],
+        }, plane.id)
+        graph = FeatureGraph([base, plane, sketch], {'position': 0})
+        manager = ActionManager(None)
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.install_parametric_graph(graph)
+        manager.profiles = [{'face': graph.results[sketch.id].profiles[0], 'sketch_id': sketch.id, 'profile_index': 0}]
+
+        preview = manager.build_revolution(0, 'vertical', 360)
+        revolve_id = manager.commit_parametric_revolution(0, 'vertical', 360)
+        self.assertEqual(len(manager.current_part.solids()), 2)
+        self.assertAlmostEqual(manager.current_part.volume, preview.volume)
+        self.assertAlmostEqual(manager.current_part.volume, 8 + 6 * math.pi ** 2)
+        self.assertTrue(manager.undo_solid())
+        self.assertAlmostEqual(manager.current_part.volume, 8)
+        self.assertTrue(manager.redo_solid())
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'revolve.fcad'
+            save_snapshot(path, manager.current_part, [], [], feature_graph=manager.parametric_graph)
+            _, _, _, restored = load_snapshot(path, include_feature_graph=True)
+            restored.set_parameters({'position': 10})
+            body = max(restored.results[revolve_id].solids(), key=lambda item: item.volume)
+            self.assertAlmostEqual(body.center().X, 10)
+            self.assertAlmostEqual(body.volume, 6 * math.pi ** 2)
+
+    def test_save_sketch_before_first_solid_and_reopen_with_redo(self):
+        plane = Feature.create('Plane', 'datum_plane', {})
+        sketch = Feature.create('Sketch', 'rectangle_sketch', {'width': 'width', 'height': 3}, plane.id)
+        extrusion = Feature.create('Extrude', 'extrude', {'distance': 4}, sketch.id)
+        manager = ActionManager(None)
+        manager.plotter = SimpleNamespace(remove_actor=Mock(), render=Mock())
+        manager.display_result = lambda part: setattr(manager, 'current_part', part)
+        manager.install_parametric_graph(FeatureGraph([plane, sketch], {'width': 2}))
+        manager.install_parametric_graph(FeatureGraph([plane, sketch, extrusion], {'width': 2}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'sketch.fcad'
+
+            def reopen():
+                save_snapshot(path, manager.current_part, [], [], feature_graph=manager.parametric_graph,
+                              graph_history={'undo': manager.graph_undo, 'redo': manager.graph_redo})
+                current, _, _, graph, history = load_snapshot(
+                    path, include_feature_graph=True, include_graph_history=True)
+                manager.install_parametric_graph(graph, reset_history=True, allow_empty=(current is None))
+                manager.graph_undo, manager.graph_redo = history['undo'], history['redo']
+
+            reopen()
+            self.assertTrue(manager.undo_solid())
+            reopen()
+            self.assertIsNone(manager.current_part)
+            graph = manager.parametric_graph
+            self.assertEqual(graph.parameters, {'width': 2})
+            self.assertAlmostEqual(graph.results[sketch.id].area, 6)
+            self.assertTrue(manager.redo_solid())
+            self.assertAlmostEqual(manager.current_part.volume, 24)
+
     def test_plane_sketch_extrude_rebuild_and_snapshot(self):
         plane = Feature.create('Plane', 'datum_plane', {'origin': (0, 0, 'offset')})
         sketch = Feature.create('Rectangle', 'rectangle_sketch', {'width': 'width', 'height': 2}, plane.id)
@@ -1445,34 +1816,6 @@ class ParametricEditorIntegrationTest(unittest.TestCase):
         manager.move_history_point('SP1.P2', (1,.5))
         np.testing.assert_allclose(manager.history_edit_graph.results[manager.history_edit_id].constraint_status.points['SP1.P2'],[1,.5],atol=1e-6)
         self.assertIsNone(manager.parametric_graph)
-
-    def test_sketch_camera_style_rotates_only_with_control(self):
-        from UI.model.sketch_navigation import SketchCameraStyle
-        manager = SimpleNamespace(_finish_history_drag=Mock())
-        style = SketchCameraStyle(manager)
-        interactor = SimpleNamespace(GetControlKey=Mock(return_value=0), GetEventPosition=lambda:(20,30))
-        with patch.object(style, 'GetInteractor', return_value=interactor), \
-             patch.object(style, 'FindPokedRenderer') as find, \
-             patch.object(style, 'GetCurrentRenderer', return_value=object()), \
-             patch.object(style, 'StartRotate') as rotate, patch.object(style, 'EndRotate') as end:
-            style._press()
-            rotate.assert_not_called()
-            interactor.GetControlKey.return_value = 1
-            style._press()
-            find.assert_called_once_with(20,30)
-            rotate.assert_called_once()
-            style._release()
-            end.assert_called_once()
-            manager._finish_history_drag.assert_called_once()
-
-    def test_sketch_camera_style_restored(self):
-        manager = ActionManager(None)
-        original = object()
-        manager.plotter = SimpleNamespace(iren=SimpleNamespace(style=original))
-        manager.lock_sketch_camera()
-        self.assertIsNot(manager.plotter.iren.style, original)
-        manager.restore_camera_style()
-        self.assertIs(manager.plotter.iren.style, original)
 
     def test_control_click_does_not_create_sketch_point(self):
         from UI.model.tools.Line import Line
@@ -1820,7 +2163,7 @@ class ParametricEditorIntegrationTest(unittest.TestCase):
         manager.plotter = SimpleNamespace(add_mesh=Mock(return_value=actor), remove_actor=Mock(), render=Mock())
         manager.parametric_graph = graph
         ui = SimpleNamespace(action_manager=manager, window=None)
-        LayoutManager.reselect_extrusion_profile(ui, solid.id)
+        LayoutManager.reselect_feature_profile(ui, solid.id)
         self.assertEqual(len(manager.profiles), 2)
         manager.profile_selection_callback(0)
         chosen = next(item for item in manager.parametric_graph.features if item.id == solid.id)
@@ -1863,6 +2206,68 @@ class ParametricEditorIntegrationTest(unittest.TestCase):
 
 
 class ParametricReferencesAndUndoTest(unittest.TestCase):
+    def test_frozen_multibody_names_survive_serialization(self):
+        import build123d as cad
+        from UI.model.legacy_conversion import encode_body
+        body = cad.Part([Box(2, 2, 2), Box(2, 2, 2).moved(Pos(8, 0, 0))])
+        feature = Feature.create('Imported', 'frozen_body', {'brep': encode_body(body)})
+        graph = FeatureGraph([feature])
+        before = graph.body_names[feature.id]
+        self.assertEqual(len(set(before)), 2)
+        self.assertNotIn(None, before)
+        restored = FeatureGraph.from_data(graph.to_data())
+        self.assertEqual(set(restored.body_names[feature.id]), set(before))
+    def test_multibody_move_copy_keeps_original_and_copy_names(self):
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': ['w', 2, 2]})
+        pattern = Feature.create('Pattern', 'rectangular_pattern', {'count_x': 2, 'count_y': 1, 'spacing_x': 8, 'spacing_y': 8}, box.id)
+        move = Feature.create('Copies', 'move', {'translation': [0, 5, 0], 'copy': True}, pattern.id)
+        graph = FeatureGraph([box, pattern, move], {'w': 2})
+        def named_centers():
+            return {tuple(round(v, 5) for v in body.center()): name for body, name in zip(graph.results[move.id].solids(), graph.body_names[move.id])}
+        before = named_centers()
+        self.assertEqual(len(before), 4)
+        self.assertNotIn(None, before.values())
+        self.assertEqual(len(set(before.values())), 4)
+        graph.set_parameters({'w': 3})
+        self.assertEqual(named_centers(), before)
+    def test_body_local_face_and_edge_survive_pattern_growth_and_resize(self):
+        from UI.model.transforms import body_index_for_face
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': ['w', 4, 4]})
+        pattern = Feature.create('Pattern', 'rectangular_pattern', {'count_x': 'n', 'count_y': 1, 'spacing_x': 8, 'spacing_y': 8}, box.id)
+        graph = FeatureGraph([box, pattern], {'w': 4, 'n': 2})
+        shape = graph.results[pattern.id]
+        body = list(shape.solids())[1]
+        face_index = next(i for i, face in enumerate(shape.faces()) if body_index_for_face(shape, i) == 1 and face.normal_at().Z > .9)
+        edge_index = next(i for i, edge in enumerate(shape.edges()) if any(edge.is_same(e) for e in body.edges()))
+        face_ref = make_reference(pattern.id, shape, 'face', face_index, graph.body_names[pattern.id])
+        edge_ref = make_reference(pattern.id, shape, 'edge', edge_index, graph.body_names[pattern.id])
+        self.assertEqual(face_ref['version'], 3)
+        self.assertEqual(edge_ref['version'], 3)
+        plane = Feature.create('Face plane', 'datum_plane', {'face': face_ref}, pattern.id)
+        fillet = Feature.create('Fillet', 'fillet', {'edges': [edge_ref], 'radius': .2}, pattern.id)
+        candidate = FeatureGraph([box, pattern, plane, fillet], {'w': 4, 'n': 2})
+        candidate.set_parameters({'w': 5, 'n': 3})
+        self.assertEqual(len(candidate.results[fillet.id].solids()), 3)
+        self.assertAlmostEqual(candidate.results[plane.id].origin.X, 8.)
+        self.assertAlmostEqual(candidate.results[plane.id].origin.Z, 2.)
+        restored = FeatureGraph.from_data(candidate.to_data())
+        self.assertEqual(len(restored.results[fillet.id].solids()), 3)
+        self.assertAlmostEqual(restored.results[plane.id].origin.X, 8.)
+        with self.assertRaises(RebuildError):
+            candidate.set_parameters({'w': 5, 'n': 1})
+        self.assertEqual(len(candidate.results[fillet.id].solids()), 3)
+
+    def test_missing_named_body_reference_fails_safely(self):
+        from UI.model.geometry_references import resolve_reference
+        box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': [4, 4, 4]})
+        pattern = Feature.create('Pattern', 'rectangular_pattern', {'count_x': 2, 'count_y': 1, 'spacing_x': 8, 'spacing_y': 8}, box.id)
+        graph = FeatureGraph([box, pattern])
+        shape = graph.results[pattern.id]
+        index = next(i for i, face in enumerate(shape.faces()) if face.center().X > 5)
+        reference = make_reference(pattern.id, shape, 'face', index, graph.body_names[pattern.id])
+        self.assertEqual(reference['version'], 3)
+        with self.assertRaises(ValueError):
+            resolve_reference(reference, shape, pattern.id, body_names=['missing'] * 2)
     def test_edge_reference_rebuilds_after_resize(self):
         box = Feature.create('Box', 'primitive', {'type': 'box', 'dimensions': ['width', 10, 10]})
         initial = FeatureGraph([box], {'width': 10})

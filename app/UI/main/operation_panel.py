@@ -10,11 +10,16 @@ class OperationPanel(QtWidgets.QFrame):
         self.content = None
         self.scroll = None
         self.navigation_size = lambda: (0, 0)
+        self._layout_timer = QtCore.QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.timeout.connect(self.reposition)
         parent.installEventFilter(self)
 
     def eventFilter(self, watched, event):
         if watched is self.parentWidget() and event.type() in (QtCore.QEvent.Resize, QtCore.QEvent.Show):
             self.reposition()
+        elif watched is self.content and event.type() == QtCore.QEvent.LayoutRequest and not self.isHidden():
+            self.queue_reposition()
         return super().eventFilter(watched, event)
 
     def reposition(self):
@@ -34,9 +39,12 @@ class OperationPanel(QtWidgets.QFrame):
         content_height = self.content.sizeHint().height() if self.title.isChecked() else 0
         height = min(available_height, header + content_height + (24 if self.title.isChecked() else 2))
         right = parent.width() - margin - (int(nav_width) + margin if left_of_navigation else 0)
-        self.setGeometry(max(0, right - width), top, width, max(1, height))
+        geometry = QtCore.QRect(max(0, right - width), top, width, max(1, height))
+        if self.geometry() != geometry:
+            self.setGeometry(geometry)
         self.raise_()
 
     def queue_reposition(self):
         self.reposition()
-        QtCore.QTimer.singleShot(0, self.reposition)
+        if not self._layout_timer.isActive():
+            self._layout_timer.start(0)

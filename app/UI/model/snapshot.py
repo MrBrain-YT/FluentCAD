@@ -46,9 +46,12 @@ def _read_shape(data):
     return shape
 
 
-def save_snapshot(path, current, undo, redo, planes=None, timeline=None, feature_graph=None, graph_history=None):
-    if current is None or not current.solids():
-        raise ValueError('Create a solid before saving a model snapshot.')
+def save_snapshot(path, current, undo, redo, planes=None, timeline=None, feature_graph=None, graph_history=None, visibility=None):
+    if current is None:
+        if feature_graph is None:
+            raise ValueError('Create a solid before saving a model snapshot.')
+    elif not current.solids():
+        raise ValueError('The current model does not contain a solid.')
     if len(undo) > MAX_HISTORY or len(redo) > MAX_HISTORY:
         raise ValueError('The model history is too large to save.')
     path = Path(path)
@@ -57,9 +60,15 @@ def save_snapshot(path, current, undo, redo, planes=None, timeline=None, feature
     manifest = {'format': 'FluentCAD-solid-snapshot', 'version': 1,
                 'undo': [x is not None for x in undo], 'redo': [x is not None for x in redo],
                 'planes': plane_data, 'timeline': timeline_data}
+    if visibility is not None:
+        manifest['visibility'] = validate_visibility(visibility)
     if feature_graph is not None:
         graph_data = feature_graph.to_data()
-        FeatureGraph.from_data(graph_data)
+        rebuilt_graph = FeatureGraph.from_data(graph_data)
+        if current is None:
+            if rebuilt_graph.latest_solid is not None or undo or redo:
+                raise ValueError('Inconsistent parametric document without a solid.')
+            manifest['has_current'] = False
         manifest['feature_graph'] = graph_data
         manifest['graph_history'] = validate_graph_history(graph_history)
     temporary = None
@@ -68,7 +77,8 @@ def save_snapshot(path, current, undo, redo, planes=None, timeline=None, feature
             temporary = Path(file.name)
         with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.writestr('manifest.json', json.dumps(manifest))
-            archive.writestr('current.brep', _write_shape(current))
+            if current is not None:
+                archive.writestr('current.brep', _write_shape(current))
             for name, shapes in [('undo', undo), ('redo', redo)]:
                 for i, shape in enumerate(shapes):
                     if shape is not None:
@@ -113,16 +123,38 @@ def validate_graph_history(history):
         values = history[key]
         if not isinstance(values, list) or len(values) > MAX_HISTORY:
             raise ValueError('Invalid parametric history length.')
-        result[key] = []
-        for value in values:
-            graph = FeatureGraph.from_data(value)
-            if not any(hasattr(item, 'solids') and item.solids() for item in graph.results.values()):
-                raise ValueError('Parametric history contains no active solid.')
-            result[key].append(graph.to_data())
+        result[key] = [FeatureGraph.from_data(value).to_data() for value in values]
     return result
 
 
-def load_snapshot(path, include_planes=False, include_timeline=False, include_feature_graph=False, include_graph_history=False):
+def validate_visibility(value):
+    if value is None:
+        return {'hidden_bodies': [], 'visible_planes': [], 'visible_sketch': None, 'hidden_body_refs': []}
+    if not isinstance(value, dict) or not {'hidden_bodies', 'visible_planes', 'visible_sketch'} <= set(value) or set(value) - {'hidden_bodies', 'visible_planes', 'visible_sketch', 'hidden_body_refs', 'hidden_body_ids'}:
+        raise ValueError('Invalid visibility settings.')
+    for key in ('hidden_bodies', 'visible_planes'):
+        if not isinstance(value[key], list) or len(value[key]) > 1000 or any(type(x) is not int or x < 0 or x > 999 for x in value[key]):
+            raise ValueError('Invalid visibility settings.')
+    sketch = value['visible_sketch']
+    if sketch is not None and (not isinstance(sketch, str) or len(sketch) > 128):
+        raise ValueError('Invalid visibility settings.')
+    from UI.model.body_visibility import validate_body_reference
+    refs = value.get('hidden_body_refs', [])
+    if not isinstance(refs, list) or len(refs) > 1000:
+        raise ValueError('Invalid visibility settings.')
+    result = {'hidden_bodies': sorted(set(value['hidden_bodies'])),
+              'visible_planes': sorted(set(value['visible_planes'])), 'visible_sketch': sketch}
+    if 'hidden_body_refs' in value:
+        result['hidden_body_refs'] = [validate_body_reference(ref) for ref in refs]
+    if 'hidden_body_ids' in value:
+        ids = value['hidden_body_ids']
+        if not isinstance(ids, list) or len(ids) > 1000 or any(not isinstance(item, str) or not item or len(item) > 4096 for item in ids):
+            raise ValueError('Invalid visibility settings.')
+        result['hidden_body_ids'] = list(dict.fromkeys(ids))
+    return result
+
+
+def load_snapshot(path, include_planes=False, include_timeline=False, include_feature_graph=False, include_graph_history=False, include_visibility=False):
     try:
         with zipfile.ZipFile(path, 'r') as archive:
             entries = archive.infolist()
@@ -136,10 +168,14 @@ def load_snapshot(path, include_planes=False, include_timeline=False, include_fe
                     raise ValueError('Snapshot entry is too large.')
                 return archive.read(info)
             manifest = json.loads(read('manifest.json'))
-            if manifest.get('format') != 'FluentCAD-solid-snapshot' or manifest.get('version') != 1:
+            if (not isinstance(manifest, dict) or manifest.get('format') != 'FluentCAD-solid-snapshot'
+                    or manifest.get('version') != 1):
                 raise ValueError('Unsupported model snapshot format or version.')
             plane_data = validate_planes(manifest.get('planes', []))
-            current = _read_shape(read('current.brep'))
+            has_current = manifest.get('has_current', True)
+            if type(has_current) is not bool or has_current != ('current.brep' in archive.namelist()):
+                raise ValueError('Invalid current geometry in model snapshot.')
+            current = _read_shape(read('current.brep')) if has_current else None
             histories = []
             for name in ('undo', 'redo'):
                 flags = manifest.get(name)
@@ -148,16 +184,23 @@ def load_snapshot(path, include_planes=False, include_timeline=False, include_fe
                 histories.append([_read_shape(read(f'{name}/{i}.brep')) if present else None
                                   for i, present in enumerate(flags)])
             timeline_data = validate_timeline(manifest.get('timeline'), len(histories[0]), len(histories[1]))
+            graph = None
+            graph_data = manifest.get('feature_graph')
+            if graph_data is not None and (include_feature_graph or not has_current):
+                graph = FeatureGraph.from_data(graph_data)
+            if not has_current and (graph is None or graph.latest_solid is not None or any(histories)):
+                raise ValueError('Inconsistent parametric document without a solid.')
             result = (current, histories[0], histories[1])
             if include_planes:
                 result += (plane_data,)
             if include_timeline:
                 result += (timeline_data,)
             if include_feature_graph:
-                graph_data = manifest.get('feature_graph')
-                result += (FeatureGraph.from_data(graph_data) if graph_data is not None else None,)
+                result += (graph,)
             if include_graph_history:
                 result += (validate_graph_history(manifest.get('graph_history')),)
+            if include_visibility:
+                result += (validate_visibility(manifest['visibility']) if 'visibility' in manifest else None,)
             return result
     except (zipfile.BadZipFile, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError('Invalid or damaged model snapshot.') from exc

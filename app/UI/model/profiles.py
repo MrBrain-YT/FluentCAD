@@ -8,7 +8,7 @@ from OCP.TopoDS import TopoDS
 from UI.model.tools.Slot import slot_edges, polyline_slot_edges
 
 
-def sketch_edges(tools, normal, tolerance=1e-6):
+def native_sketch_edges(tools, normal, tolerance=1e-6):
     edges = []
     for tool in tools:
         points = [tuple(float(v) for v in p) for p in tool.points]
@@ -72,6 +72,30 @@ def sketch_edges(tools, normal, tolerance=1e-6):
     return edges
 
 
+def indexed_sketch_edges(tool, normal, tolerance=1e-6):
+    from UI.model.curve_spans import curve_interval
+
+    edges = native_sketch_edges([tool], normal, tolerance)
+    if tool.type == 'line':
+        indices = [i for i, (a, b) in enumerate(zip(tool.points, tool.points[1:]))
+                   if np.linalg.norm(np.subtract(a, b)) > tolerance]
+        segments = list(zip(indices, edges))
+    else:
+        spans = getattr(tool, 'curve_spans', {})
+        if any(index >= len(edges) for index in spans):
+            raise ValueError('An edited sketch curve segment is missing.')
+        segments = [(token, curve_interval(edge, start, end) if index in spans else edge)
+                    for index, edge in enumerate(edges)
+                    for token, start, end in spans.get(index, [(index, 0., 1.)])]
+    limits = getattr(tool, 'corner_limits', {})
+    return [(token, curve_interval(edge, *limits[token]) if token in limits else edge)
+            for token, edge in segments]
+
+
+def sketch_edges(tools, normal, tolerance=1e-6):
+    return [edge for tool in tools for _, edge in indexed_sketch_edges(tool, normal, tolerance)]
+
+
 def _explore(shape, kind):
     explorer = TopExp_Explorer(shape, kind)
     result = []
@@ -97,9 +121,10 @@ def split_edges(edges, tolerance=1e-6):
     return _explore(splitter.Shape(), TopAbs_EDGE)
 
 
-def build_profiles(tools, normal, tolerance=1e-6):
+def build_profiles(tools, normal, tolerance=1e-6, linked_edges=()):
     """Extract all bounded cells, including regions with holes, from a planar sketch."""
     edges = sketch_edges([tool for tool in tools if not getattr(tool, 'is_construction', False)], normal, tolerance)
+    edges.extend(linked_edges)
     if not edges:
         return []
     if len(edges) == 1 and edges[0].is_closed:

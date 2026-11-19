@@ -1,6 +1,34 @@
 """Bridge line endpoints in an active sketch to the numerical solver."""
 import numpy as np
 from UI.model.constraints import Constraint, solve_constraints
+from UI.model.parametric_sketch import circle_radius_name
+
+
+def segment_reference(entities, index, segment, *, splines=False):
+    if not 0 <= index < len(entities):
+        return None
+    entity = entities[index]
+    kind = entity['type']
+    if kind == 'circle':
+        refs = entity['center'], circle_radius_name(index)
+    elif kind == 'line':
+        refs = entity['points'][segment:segment + 2]
+    elif kind == 'arc':
+        refs = entity['points']
+    elif splines and kind in ('spline', 'fit_spline', 'nurbs'):
+        names = entity['points']
+        if not all(isinstance(name, str) for name in names):
+            return None
+        if kind == 'nurbs':
+            refs = ('@nurbs', index)
+        elif kind == 'fit_spline':
+            refs = ('@fit', *names)
+        else:
+            refs = tuple(names)
+        return 'spline', tuple(refs)
+    else:
+        return None
+    return (kind, tuple(refs)) if all(isinstance(ref, str) for ref in refs) else None
 
 
 def history_line_points(manager):

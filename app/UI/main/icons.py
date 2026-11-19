@@ -3,12 +3,14 @@ from PySide6 import QtCore, QtGui
 
 
 def tool_icon(kind):
+    if not isinstance(kind, str):
+        kind = 'feature'
     pixmap = QtGui.QPixmap(48, 48)
     pixmap.fill(QtCore.Qt.transparent)
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing)
     painter.scale(1.5, 1.5)
-    pen = QtGui.QPen(QtGui.QColor('#347ca4'), 2)
+    pen = QtGui.QPen(QtGui.QColor('#418eb6'), 2)
     pen.setCapStyle(QtCore.Qt.RoundCap)
     pen.setJoinStyle(QtCore.Qt.RoundJoin)
     painter.setPen(pen)
@@ -43,6 +45,19 @@ def tool_icon(kind):
     elif kind == 'torus':
         painter.drawEllipse(4, 9, 24, 14)
         painter.drawEllipse(11, 13, 10, 6)
+    elif kind == 'constraint':
+        painter.drawLine(6, 24, 6, 8)
+        painter.drawLine(6, 24, 26, 24)
+        painter.drawLine(6, 17, 13, 17)
+        painter.drawLine(13, 17, 13, 24)
+    elif kind.startswith('dimension'):
+        painter.drawLine(5, 8, 5, 24)
+        painter.drawLine(27, 8, 27, 24)
+        painter.drawLine(5, 16, 27, 16)
+        painter.drawLine(5, 16, 10, 13)
+        painter.drawLine(5, 16, 10, 19)
+        painter.drawLine(27, 16, 22, 13)
+        painter.drawLine(27, 16, 22, 19)
     elif kind == 'extrude':
         painter.setBrush(QtGui.QColor('#a8d5e9'))
         painter.drawPolygon(QtGui.QPolygon([QtCore.QPoint(6, 11), QtCore.QPoint(19, 11), QtCore.QPoint(25, 6), QtCore.QPoint(12, 6)]))
@@ -55,6 +70,25 @@ def tool_icon(kind):
         painter.drawArc(6, 8, 20, 16, 10 * 16, 155 * 16)
         painter.drawLine(6, 15, 6, 8)
         painter.drawLine(6, 15, 13, 15)
+    elif kind.startswith('timeline_'):
+        if kind in ('timeline_next', 'timeline_last'):
+            painter.translate(32, 0)
+            painter.scale(-1, 1)
+        painter.drawLine(21, 8, 12, 16)
+        painter.drawLine(12, 16, 21, 24)
+        if kind in ('timeline_first', 'timeline_last'):
+            painter.drawLine(7, 7, 7, 25)
+    elif kind == 'browser':
+        painter.drawRoundedRect(4, 6, 24, 20, 2, 2)
+        painter.drawLine(13, 6, 13, 26)
+        painter.drawLine(7, 11, 10, 11)
+        painter.drawLine(7, 16, 10, 16)
+        painter.drawLine(7, 21, 10, 21)
+    elif kind == 'view_options':
+        for y, x in ((8, 12), (16, 21), (24, 10)):
+            painter.drawLine(5, y, 27, y)
+            painter.setBrush(QtGui.QColor('#bed9eb'))
+            painter.drawEllipse(QtCore.QPoint(x, y), 3, 3)
     elif kind == 'fit':
         painter.drawRect(8, 8, 16, 16)
         painter.drawLine(4, 11, 4, 4)
@@ -66,6 +100,13 @@ def tool_icon(kind):
         painter.drawLine(19, 19, 27, 27)
         painter.drawLine(9, 13, 16, 13)
         painter.drawLine(12, 10, 12, 16)
+    elif kind == 'view_menu':
+        painter.drawPolygon(QtGui.QPolygon([QtCore.QPoint(16, 4), QtCore.QPoint(27, 10),
+                                           QtCore.QPoint(27, 22), QtCore.QPoint(16, 28),
+                                           QtCore.QPoint(5, 22), QtCore.QPoint(5, 10)]))
+        painter.drawLine(16, 16, 16, 28)
+        painter.drawLine(5, 10, 16, 16)
+        painter.drawLine(16, 16, 27, 10)
     elif kind == 'projection':
         painter.drawRect(6, 9, 14, 14)
         painter.drawLine(6, 9, 13, 4)
@@ -136,6 +177,16 @@ def tool_icon(kind):
         painter.drawLine(16, 8, 16, 21)
         painter.drawLine(12, 17, 16, 21)
         painter.drawLine(20, 17, 16, 21)
+    elif kind == 'loft':
+        painter.drawEllipse(4, 19, 24, 8)
+        painter.drawEllipse(9, 5, 14, 6)
+        painter.drawLine(9, 8, 4, 23)
+        painter.drawLine(23, 8, 28, 23)
+    elif kind == 'sweep':
+        painter.drawEllipse(4, 20, 13, 6)
+        painter.drawArc(7, 5, 17, 22, 15 * 16, 160 * 16)
+        painter.drawLine(24, 11, 28, 10)
+        painter.drawLine(24, 11, 23, 7)
     elif kind == 'revolve':
         painter.drawEllipse(7, 7, 18, 18)
         painter.drawLine(16, 4, 16, 28)
@@ -172,5 +223,9 @@ def tool_icon(kind):
         painter.setPen(QtGui.QPen(QtGui.QColor('#399a69'), 3))
         painter.drawLine(5, 17, 13, 24)
         painter.drawLine(13, 24, 27, 8)
+    else:
+        painter.drawRoundedRect(6, 6, 20, 20, 3, 3)
+        painter.drawLine(11, 13, 21, 13)
+        painter.drawLine(11, 19, 18, 19)
     painter.end()
     return QtGui.QIcon(pixmap)

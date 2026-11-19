@@ -96,6 +96,7 @@ class ParametricSketchDialog(QtWidgets.QDialog):
         label.setWordWrap(True)
         layout.addWidget(label)
         self.scene = QtWidgets.QGraphicsScene(self)
+        self.scene.setBackgroundBrush(QtGui.QColor('#f5f7fa'))
         self.view = SketchView(self.scene, self)
         self.view.setRenderHint(QtGui.QPainter.Antialiasing)
         self.view.scale(1, -1)
@@ -225,16 +226,21 @@ class ParametricSketchDialog(QtWidgets.QDialog):
         self.draft_item.setPath(QtGui.QPainterPath())
         self.message.setText('Drawing cancelled.')
 
-    def edit_nurbs_parameters(self):
+    def edit_nurbs_parameters(self, selected_index=None):
         entities = self.feature().parameters['entities']
         choices = [(i, item) for i, item in enumerate(entities) if item.get('type') in ('nurbs', 'periodic_nurbs')]
         if not choices:
             self.message.setText('The sketch has no NURBS.')
             return
         labels = [f"{item['type']} {i+1}" for i, item in choices]
-        selected, ok = self.panel_inputs.getItem(self, 'NURBS', 'Curve:', labels, 0, False)
-        if not ok: return
-        index, entity = choices[labels.index(selected)]
+        if selected_index is None:
+            selected, ok = self.panel_inputs.getItem(self, 'NURBS', 'Curve:', labels, 0, False)
+            if not ok: return
+            index, entity = choices[labels.index(selected)]
+        else:
+            match = next((choice for choice in choices if choice[0] == selected_index), None)
+            if match is None: raise ValueError('Select a NURBS curve.')
+            index, entity = match
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle('NURBS parameters')
         form = QtWidgets.QFormLayout(dialog)
@@ -1018,14 +1024,18 @@ class ParametricSketchDialog(QtWidgets.QDialog):
             self.message.setText(str(exc))
         self.refresh_geometry()
 
-    def create_spline_constraint(self, mode):
+    def create_spline_constraint(self, mode, selected_index=None):
         if not self.splines:
             self.message.setText('The sketch has no cubic splines.')
             return
         spline_labels = [f'Spline {i + 1}: {pts[0]} → {pts[-1]}' for _, pts, i in self.splines]
-        chosen, ok = self.panel_inputs.getItem(self, 'Constraint', 'Spline:', spline_labels, 0, False)
-        if not ok: return
-        first_index = spline_labels.index(chosen)
+        if selected_index is None:
+            chosen, ok = self.panel_inputs.getItem(self, 'Constraint', 'Spline:', spline_labels, 0, False)
+            if not ok: return
+            first_index = spline_labels.index(chosen)
+        else:
+            first_index = next((j for j, (_, _, index) in enumerate(self.splines) if index == selected_index), -1)
+            if first_index < 0: raise ValueError('Select an open spline.')
         first = self.splines[first_index][1]
         endpoint, ok = self.panel_inputs.getItem(self, 'Constraint', 'Spline endpoint:', [first[0], first[-1]], 0, False)
         if not ok: return
@@ -1161,7 +1171,7 @@ class ParametricSketchDialog(QtWidgets.QDialog):
             self.message.setText(str(exc))
         self.refresh_geometry()
 
-    def create_curve_curvature(self):
+    def create_curve_curvature(self, selected_index=None):
         entries = [(i, item) for i, item in enumerate(self.feature().parameters['entities'])
                    if item.get('type') in ('line','arc','circle','ellipse','spline','fit_spline','nurbs','periodic_nurbs')
                    and (item['type'] != 'line' or len(item.get('points', [])) == 2)]
@@ -1169,8 +1179,12 @@ class ParametricSketchDialog(QtWidgets.QDialog):
             self.message.setText('Add two supported curves first.')
             return
         labels = [f"{item['type']} {index+1}" for index, item in entries]
-        first, ok = self.panel_inputs.getItem(self, 'Curvature', 'First curve:', labels, 0, False)
-        if not ok: return
+        if selected_index is None:
+            first, ok = self.panel_inputs.getItem(self, 'Curvature', 'First curve:', labels, 0, False)
+            if not ok: return
+        else:
+            first = next((labels[i] for i, (index, _) in enumerate(entries) if index == selected_index), None)
+            if first is None: raise ValueError('Select a supported curve.')
         second, ok = self.panel_inputs.getItem(self, 'Curvature', 'Second curve:', labels, 1, False)
         if not ok: return
         if first == second:

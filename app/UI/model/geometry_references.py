@@ -41,12 +41,27 @@ def _descriptor(shape, item, kind):
     return result
 
 
-def make_reference(feature_id, shape, kind, index):
+def make_reference(feature_id, shape, kind, index, body_names=None):
     if not isinstance(feature_id, str) or not feature_id:
         raise ValueError('A source feature ID is required.')
     candidates = _entities(shape, kind)
     if type(index) is not int or not 0 <= index < len(candidates):
         raise ValueError('Invalid geometry index.')
+    if body_names is not None:
+        bodies = list(shape.solids())
+        owners = [(i, body) for i, body in enumerate(bodies)
+                  if any(candidate.is_same(candidates[index]) for candidate in _entities(body, kind))]
+        if len(owners) == 1:
+            body_index, body = owners[0]
+            name = body_names[body_index] if body_index < len(body_names) else None
+            if name is not None and list(body_names).count(name) == 1:
+                local = _entities(body, kind)
+                matches = [i for i, item in enumerate(local) if item.is_same(candidates[index])]
+                if len(matches) == 1:
+                    reference = {'version': 3, 'feature_id': feature_id, 'kind': kind, 'body_id': name,
+                                 'local': make_reference(feature_id, body, kind, matches[0])}
+                    if resolve_reference(reference, shape, feature_id, body_names=body_names) == index:
+                        return reference
     reference = {'version': 2, 'feature_id': feature_id, 'kind': kind,
                  'topology': _topology(shape), **_descriptor(shape, candidates[index], kind)}
     if resolve_reference(reference, shape, feature_id) != index:
@@ -64,12 +79,29 @@ def _vector(value, label):
     return result
 
 
-def resolve_reference(reference, shape, feature_id, tolerance=0.05):
+def resolve_reference(reference, shape, feature_id, tolerance=0.05, body_names=None):
     if not isinstance(reference, dict) or reference.get('feature_id') != feature_id:
         raise ValueError('Geometry reference points to a different feature.')
     kind = reference.get('kind')
     entities = _entities(shape, kind)
     version = reference.get('version', 1)
+    if version == 3:
+        name = reference.get('body_id')
+        if not isinstance(name, str) or not name or not isinstance(body_names, (tuple, list)):
+            raise ValueError('Body naming is unavailable for this reference.')
+        matches = [i for i, candidate in enumerate(body_names) if candidate == name]
+        bodies = list(shape.solids())
+        if len(matches) != 1 or matches[0] >= len(bodies):
+            raise ValueError('Referenced body is missing or ambiguous after rebuild.')
+        body = bodies[matches[0]]
+        local = reference.get('local')
+        if not isinstance(local, dict) or local.get('kind') != kind or local.get('version') != 2:
+            raise ValueError('Invalid body-local geometry reference.')
+        item = _entities(body, kind)[resolve_reference(local, body, feature_id, tolerance)]
+        indices = [i for i, candidate in enumerate(entities) if candidate.is_same(item)]
+        if len(indices) != 1:
+            raise ValueError('Referenced geometry is missing or shared ambiguously.')
+        return indices[0]
     if version not in (1, 2):
         raise ValueError('Unsupported geometry reference version.')
     if version == 2 and reference.get('topology') != _topology(shape):

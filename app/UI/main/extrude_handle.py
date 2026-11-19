@@ -6,11 +6,15 @@ import vtk
 from PySide6 import QtCore
 
 
-def world_per_pixel(camera, height):
+def world_per_pixel(camera, height, point=None):
     height = max(int(height), 1)
     if camera.GetParallelProjection():
         return 2.0 * camera.GetParallelScale() / height
-    distance = np.linalg.norm(np.asarray(camera.position) - np.asarray(camera.focal_point))
+    position = np.asarray(camera.position, dtype=float)
+    forward = np.asarray(camera.focal_point, dtype=float) - position
+    distance = np.linalg.norm(forward)
+    if point is not None and distance > 1e-12:
+        distance = max(float(np.dot(np.asarray(point, dtype=float) - position, forward / distance)), 1e-8)
     return 2.0 * distance * math.tan(math.radians(camera.GetViewAngle()) / 2) / height
 
 
@@ -18,17 +22,24 @@ def projected_axis_delta(cursor_start, cursor_now, screen_start, screen_end, wor
     axis = np.asarray(screen_end, dtype=float)[:2] - np.asarray(screen_start, dtype=float)[:2]
     length2 = float(np.dot(axis, axis))
     if length2 < 9.: return 0.0
-    return float(np.dot(np.asarray(cursor_now, dtype=float)[:2] - np.asarray(cursor_start, dtype=float)[:2], axis) / length2 * world_length)
+    # A nearly head-on axis has a very short projection. Limit sensitivity so
+    # tiny mouse movements cannot send the model distance to extreme values.
+    return float(np.dot(np.asarray(cursor_now, dtype=float)[:2] - np.asarray(cursor_start, dtype=float)[:2], axis) / max(length2, 400.) * world_length)
 
 
 def axis_drag_projection(plotter, anchor, direction):
     renderer = plotter.renderer
-    length = max(world_per_pixel(plotter.camera, plotter.ren_win.GetSize()[1]) * 80, 1e-8)
+    length = max(world_per_pixel(plotter.camera, plotter.ren_win.GetSize()[1], anchor) * 80, 1e-8)
     def project(point):
         renderer.SetWorldPoint(*map(float, point), 1.)
         renderer.WorldToDisplay()
         return tuple(renderer.GetDisplayPoint())
     return project(anchor), project(anchor + np.asarray(direction)*length), length
+
+
+def cursor_position(handle):
+    position = getattr(handle, '_pointer_position', None)
+    return position if position is not None else handle.plotter.iren.get_event_position()
 
 
 def add_outline_arrow(plotter, name, start, tip, direction, size, color='#258bcc'):
@@ -61,9 +72,20 @@ def add_outline_arrow(plotter, name, start, tip, direction, size, color='#258bcc
     meshes = (pv.Line(start, tip),
               pv.PolyData(points[1], np.array([len(outer), *range(len(outer))])),
               pv.PolyData(points[2], np.array([len(inner), *range(len(inner))])))
-    for mesh, suffix, shade in zip(meshes, ('_guide', '', '_inset'), (color, color, 'white')):
-        plotter.add_mesh(mesh, name=name + suffix, color=shade, line_width=2,
-                         lighting=False, pickable=False, reset_camera=False, render=False)
+    overlay_actors = []
+    for mesh, suffix, shade in zip(meshes, ('_guide', '', '_inset'), (color, 'white', color)):
+        actor = plotter.add_mesh(mesh, name=name + suffix, color=shade, line_width=2,
+                                lighting=False, pickable=False, reset_camera=False, render=False)
+        overlay = getattr(plotter, '_fluent_overlay_renderer', None)
+        if overlay is not None:
+            plotter.renderer.RemoveActor(actor)
+            overlay.AddActor(actor)
+            overlay_actors.append(actor)
+    if overlay_actors:
+        actors = getattr(plotter, '_fluent_arrow_actors', None)
+        if not isinstance(actors, dict):
+            actors = plotter._fluent_arrow_actors = {}
+        actors[name] = overlay_actors
     cache[name] = meshes
 
 
@@ -71,8 +93,75 @@ def remove_outline_arrow(plotter, name):
     cache = getattr(plotter, '_fluent_arrow_meshes', None)
     if isinstance(cache, dict):
         cache.pop(name, None)
+    actors = getattr(plotter, '_fluent_arrow_actors', None)
+    overlay = getattr(plotter, '_fluent_overlay_renderer', None)
+    if isinstance(actors, dict) and overlay is not None:
+        for actor in actors.pop(name, []):
+            overlay.RemoveActor(actor)
     for suffix in ('', '_guide', '_inset'):
         plotter.remove_actor(name + suffix, render=False)
+
+
+def update_handle_line(plotter, name, points, color):
+    cache = getattr(plotter, '_fluent_handle_lines', None)
+    if not isinstance(cache, dict):
+        cache = plotter._fluent_handle_lines = {}
+    points = np.asarray(points, dtype=float)
+    if name in cache:
+        cache[name].points = points
+    else:
+        mesh = pv.lines_from_points(points)
+        plotter.add_mesh(mesh, name=name, color=color, line_width=3,
+                         pickable=False, reset_camera=False, render=False)
+        cache[name] = mesh
+
+
+def remove_handle_line(plotter, name):
+    cache = getattr(plotter, '_fluent_handle_lines', None)
+    if isinstance(cache, dict):
+        cache.pop(name, None)
+    plotter.remove_actor(name, render=False)
+
+
+def update_ring_knob(plotter, name, point):
+    point = np.asarray(point, dtype=float)
+    view = np.asarray(plotter.camera.position, dtype=float) - point
+    view /= max(np.linalg.norm(view), 1e-12)
+    reference = np.array([0., 1., 0.]) if abs(view[1]) < .9 else np.array([1., 0., 0.])
+    first = np.cross(view, reference)
+    first /= max(np.linalg.norm(first), 1e-12)
+    second = np.cross(view, first)
+    radius = max(world_per_pixel(plotter.camera, plotter.ren_win.GetSize()[1], point) * 5., 1e-6)
+    theta = np.linspace(0., 2 * np.pi, 25)
+    points = point + radius * (np.cos(theta)[:, None] * first + np.sin(theta)[:, None] * second)
+    update_handle_line(plotter, name, points, '#a5adb2')
+
+
+def accumulate_ring_angle(handle, initial_angle, current_angle):
+    previous = getattr(handle, '_ring_previous', None)
+    if previous is None:
+        previous = initial_angle
+        handle._ring_total = 0.
+    handle._ring_total += (current_angle - previous + 180.) % 360. - 180.
+    handle._ring_previous = current_angle
+    return handle._ring_total
+
+
+def ring_drag_delta(handle, start_angle, current_angle, start_cursor, cursor):
+    """Keep a continuous angle when a projected ring becomes edge-on."""
+    if not hasattr(handle, '_ring_last_cursor') or handle._ring_last_cursor is None:
+        handle._ring_last_cursor = start_cursor
+        handle._ring_previous = start_angle
+        handle._ring_total = 0.
+    if current_angle is None:
+        handle._ring_total += (cursor[1] - handle._ring_last_cursor[1]) * .5
+        handle._ring_previous = None
+    elif handle._ring_previous is None:
+        handle._ring_previous = current_angle
+    else:
+        accumulate_ring_angle(handle, start_angle, current_angle)
+    handle._ring_last_cursor = cursor
+    return handle._ring_total
 
 
 def observe_arrow_camera(handle):
@@ -116,6 +205,13 @@ def stop_handle_sync(handle):
         timer.stop()
 
 
+def finish_handle_drag(handle):
+    stop_handle_sync(handle)
+    flush = getattr(getattr(handle, 'dialog', None), 'flush_preview', None)
+    if not callable(flush) or not flush():
+        handle.sync()
+
+
 def projected_ring_angle(cursor, center, first, second):
     """Angle in a projected ring basis; None when the ring is edge-on."""
     matrix = np.column_stack((np.asarray(first)[:2] - np.asarray(center)[:2],
@@ -133,18 +229,27 @@ class ExtrudeHandle:
         self.dialog = dialog
         self.plotter = dialog.manager.plotter
         self.anchor = np.asarray(tuple(dialog.manager.profiles[dialog.index]['face'].center()), dtype=float)
-        self.normal = np.asarray(dialog.manager.active_normal, dtype=float)
+        self.normal = np.array(dialog.manager.active_normal, dtype=float)
         self.normal /= np.linalg.norm(self.normal)
         self.drag_start = None
         self.updating = False
+        self.value_editors = {}
+        if hasattr(self.plotter, 'devicePixelRatioF'):
+            from UI.main.scene_value_editor import SceneValueEditor
+            self.value_editors = {'primary': SceneValueEditor(self.plotter, dialog.distance),
+                                  'opposite': SceneValueEditor(self.plotter, dialog.second_distance)}
         self.widgets, self.representations = {}, {}
+        self.hit_filter = None
+        if hasattr(self.plotter, 'installEventFilter'):
+            from UI.main.arrow_hit_filter import ArrowHitFilter
+            self.hit_filter = ArrowHitFilter(self)
         for key in ('primary', 'opposite'):
             rep = vtk.vtkPointHandleRepresentation3D()
             rep.SetHandleSize(11)
             rep.GetProperty().SetColor(.22, .57, .82)
             rep.GetSelectedProperty().SetColor(.65, .85, 1.)
-            rep.GetProperty().SetOpacity(.01)
-            rep.GetSelectedProperty().SetOpacity(.01)
+            rep.GetProperty().SetOpacity(0.)
+            rep.GetSelectedProperty().SetOpacity(0.)
             widget = vtk.vtkHandleWidget()
             widget.SetInteractor(self.plotter.iren.interactor)
             widget.SetRepresentation(rep)
@@ -156,43 +261,59 @@ class ExtrudeHandle:
         self.sync()
         observe_arrow_camera(self)
 
-    def sync(self):
+    def sync(self, render=True):
         if self.updating:
             return
-        enabled = self.dialog.extent.currentData() == 'distance'
+        enabled = self.dialog.extent.currentData() == 'distance' and bool(getattr(self.dialog, 'indices', (0,)))
         two = self.dialog.direction.currentData() in ('two', 'symmetric')
         self.widgets['primary'].SetEnabled(enabled)
         self.widgets['opposite'].SetEnabled(enabled and two)
         if not enabled:
+            if getattr(self, 'hit_filter', None) is not None: self.hit_filter.segments.clear()
             for key in self.widgets: remove_outline_arrow(self.plotter, 'extrude_arrow_' + key)
+            for editor in getattr(self, 'value_editors', {}).values(): editor.hide()
             return
+        editors = getattr(self, 'value_editors', {})
+        if 'opposite' in editors:
+            editors['opposite'].setVisible(two and self.dialog.direction.currentData() == 'two')
         if not two and 'extrude_arrow_opposite' in getattr(self.plotter, '_fluent_arrow_meshes', {}):
             remove_outline_arrow(self.plotter, 'extrude_arrow_opposite')
+        if getattr(self, 'hit_filter', None) is not None:
+            self.hit_filter.segments.clear()
         offset = self.dialog.offset.value()
         distance = self.dialog.distance.value()
-        length = max(world_per_pixel(self.plotter.camera, self.plotter.ren_win.GetSize()[1]) * 16, 1e-6)
         for key in ('primary', 'opposite'):
             if key == 'opposite' and not two: continue
             value = distance if key == 'primary' or self.dialog.direction.currentData() == 'symmetric' else self.dialog.second_distance.value()
             direction = self.normal if key == 'primary' else -self.normal
-            point = self.anchor + self.normal * offset + direction * value
             visual_direction = direction if value >= 0 else -direction
+            endpoint = self.anchor + self.normal * offset + direction * value
+            length = max(world_per_pixel(self.plotter.camera, self.plotter.ren_win.GetSize()[1], endpoint) * 30, 1e-6)
+            # Keep the arrowhead beyond the end face, rather than inside the solid.
+            point = endpoint + visual_direction * length
             self.representations[key].SetWorldPosition(tuple(point))
             add_outline_arrow(self.plotter, 'extrude_arrow_' + key, self.anchor + self.normal * offset,
                               point, visual_direction, length)
-        self.plotter.render()
+            if getattr(self, 'hit_filter', None) is not None:
+                self.hit_filter.segments[key] = (self.anchor + self.normal * offset, point)
+            if key in editors and (key == 'primary' or self.dialog.direction.currentData() == 'two'):
+                editors[key].set_point(point)
+        if render:
+            self.plotter.render()
 
     def start_drag(self, key='primary'):
         field = self.dialog.second_distance if key == 'opposite' and self.dialog.direction.currentData() == 'two' else self.dialog.distance
         direction = self.normal if key == 'primary' else -self.normal
         point = np.asarray(self.representations[key].GetWorldPosition())
-        self.drag_start = (key, tuple(self.plotter.iren.get_event_position()), field.value(), axis_drag_projection(self.plotter, point, direction))
+        cursor = getattr(self, '_pointer_position', None)
+        self.drag_start = (key, tuple(cursor if cursor is not None else cursor_position(self)), field.value(), axis_drag_projection(self.plotter, point, direction))
 
     def drag(self, key='primary'):
         if self.drag_start is None or self.drag_start[0] != key:
             return
         _, cursor, initial, (a, b, length) = self.drag_start
-        value = initial + projected_axis_delta(cursor, self.plotter.iren.get_event_position(), a, b, length)
+        position = getattr(self, '_pointer_position', None)
+        value = initial + projected_axis_delta(cursor, position if position is not None else cursor_position(self), a, b, length)
         field = self.dialog.second_distance if key == 'opposite' and self.dialog.direction.currentData() == 'two' else self.dialog.distance
         self.updating = True
         try:
@@ -203,13 +324,14 @@ class ExtrudeHandle:
 
     def end_drag(self, *args):
         self.drag_start = None
-        stop_handle_sync(self)
-        self.sync()
+        finish_handle_drag(self)
 
     def close(self):
         stop_handle_sync(self)
+        if self.hit_filter is not None: self.hit_filter.dispose()
         self._camera_timer.stop()
         self.plotter.camera.RemoveObserver(self._camera_observer)
+        for editor in self.value_editors.values(): editor.dispose()
         for key, widget in self.widgets.items():
             widget.EnabledOff()
             widget.RemoveAllObservers()
@@ -222,6 +344,10 @@ class MoveAxisHandles:
     def __init__(self, dialog):
         self.dialog, self.plotter = dialog, dialog.manager.plotter
         self.widgets, self.representations = {}, {}
+        self.hit_filter = None
+        if hasattr(self.plotter, 'installEventFilter'):
+            from UI.main.arrow_hit_filter import ArrowHitFilter
+            self.hit_filter = ArrowHitFilter(self)
         self.drag_start, self.updating = None, False
         colors = {'X': (0.88, 0.25, 0.22), 'Y': (0.25, 0.72, 0.35), 'Z': (0.22, 0.47, 0.9)}
         for axis in 'XYZ':
@@ -229,8 +355,8 @@ class MoveAxisHandles:
             representation.SetHandleSize(13)
             representation.GetProperty().SetColor(*colors[axis])
             representation.GetSelectedProperty().SetColor(1., 0.8, 0.25)
-            representation.GetProperty().SetOpacity(.01)
-            representation.GetSelectedProperty().SetOpacity(.01)
+            representation.GetProperty().SetOpacity(0.)
+            representation.GetSelectedProperty().SetOpacity(0.)
             widget = vtk.vtkHandleWidget()
             widget.SetInteractor(self.plotter.iren.interactor)
             widget.SetRepresentation(representation)
@@ -242,7 +368,7 @@ class MoveAxisHandles:
         self.sync()
         observe_arrow_camera(self)
 
-    def sync(self):
+    def sync(self, render=True):
         if self.updating:
             return
         shape = self.dialog.manager.current_part
@@ -255,7 +381,7 @@ class MoveAxisHandles:
         translation = np.array([self.dialog.controls['d' + axis].value() for axis in 'XYZ'])
         center += translation
         height = self.plotter.ren_win.GetSize()[1]
-        length = max(world_per_pixel(self.plotter.camera, height) * 80, 1e-6)
+        length = max(world_per_pixel(self.plotter.camera, height, center) * 80, 1e-6)
         colors = {'X': '#e54138', 'Y': '#40b95a', 'Z': '#3878e5'}
         for i, axis in enumerate('XYZ'):
             direction = np.eye(3)[i]
@@ -263,19 +389,22 @@ class MoveAxisHandles:
             self.representations[axis].SetWorldPosition(tuple(point))
             name = 'move_axis_' + axis
             add_outline_arrow(self.plotter, name, center, point, direction, length * .2, colors[axis])
-        self.plotter.render()
+            if self.hit_filter is not None:
+                self.hit_filter.segments[axis] = (center, point)
+        if render:
+            self.plotter.render()
 
     def start_drag(self, axis):
         point = np.asarray(self.representations[axis].GetWorldPosition())
         direction = np.eye(3)['XYZ'.index(axis)]
-        self.drag_start = (axis, tuple(self.plotter.iren.get_event_position()),
+        self.drag_start = (axis, tuple(cursor_position(self)),
                            self.dialog.controls['d' + axis].value(), axis_drag_projection(self.plotter, point, direction))
 
     def drag(self, axis):
         if self.drag_start is None or self.drag_start[0] != axis:
             return
         _, start, initial, (a,b,length) = self.drag_start
-        value = initial + projected_axis_delta(start, self.plotter.iren.get_event_position(), a, b, length)
+        value = initial + projected_axis_delta(start, cursor_position(self), a, b, length)
         self.updating = True
         try:
             self.dialog.controls['d' + axis].setValue(value)
@@ -285,11 +414,11 @@ class MoveAxisHandles:
 
     def end_drag(self):
         self.drag_start = None
-        stop_handle_sync(self)
-        self.sync()
+        finish_handle_drag(self)
 
     def close(self):
         stop_handle_sync(self)
+        if self.hit_filter is not None: self.hit_filter.dispose()
         self._camera_timer.stop()
         self.plotter.camera.RemoveObserver(self._camera_observer)
         for axis in 'XYZ':
@@ -306,13 +435,16 @@ class ParameterHandles:
         self.keys = 'XYZ' if mode == 'rotate' else 'S'
         self.widgets, self.representations = {}, {}
         self.drag_start, self.updating = None, False
-        self.colors = {'X': (0.88, .25, .22), 'Y': (.25, .72, .35),
-                       'Z': (.22, .47, .9), 'S': (1., .65, .1)}
+        self.colors = {'X': (.58, .62, .65), 'Y': (.58, .62, .65),
+                       'Z': (.58, .62, .65), 'S': (.22, .56, .8)}
         for key in self.keys:
             rep = vtk.vtkPointHandleRepresentation3D()
             rep.SetHandleSize(12)
             rep.GetProperty().SetColor(*self.colors[key])
-            rep.GetSelectedProperty().SetColor(1., .8, .25)
+            rep.GetSelectedProperty().SetColor(.22, .56, .8)
+            if self.mode == 'rotate':
+                rep.GetProperty().SetOpacity(.01)
+                rep.GetSelectedProperty().SetOpacity(.01)
             widget = vtk.vtkHandleWidget()
             widget.SetInteractor(self.plotter.iren.interactor)
             widget.SetRepresentation(rep)
@@ -322,30 +454,24 @@ class ParameterHandles:
             self.widgets[key], self.representations[key] = widget, rep
             widget.EnabledOn()
         self.sync()
+        observe_arrow_camera(self)
 
     def center_and_size(self):
-        shape = self.dialog.manager.current_part
-        if self.dialog.scope.currentData() == 'selected':
-            shape = list(shape.solids())[self.dialog.selected_body]
-        bounds = shape.bounding_box()
-        center = np.array([(bounds.min.X + bounds.max.X) / 2, (bounds.min.Y + bounds.max.Y) / 2,
-                           (bounds.min.Z + bounds.max.Z) / 2])
         if self.mode == 'rotate':
             center = np.array([self.dialog.controls['p' + axis].value() for axis in 'XYZ'])
             center += np.array([self.dialog.controls['d' + axis].value() for axis in 'XYZ'])
         else:
             center = np.array([self.dialog.controls['p' + axis].value() for axis in 'XYZ'])
         height = self.plotter.ren_win.GetSize()[1]
-        length = max(world_per_pixel(self.plotter.camera, height) * 80, 1e-6)
+        length = max(world_per_pixel(self.plotter.camera, height, center) * 80, 1e-6)
         return center, length
 
-    def sync(self):
+    def sync(self, render=True):
         if self.updating:
             return
         center, length = self.center_and_size()
         for key in self.keys:
             name = 'parameter_handle_' + self.mode + key
-            self.plotter.remove_actor(name, render=False)
             if self.mode == 'rotate':
                 axis = np.eye(3)['XYZ'.index(key)]
                 reference = np.eye(3)[('XYZ'.index(key) + 1) % 3]
@@ -353,17 +479,17 @@ class ParameterHandles:
                 tangent = np.cross(axis, reference)
                 handle_point = center + length * (np.cos(angle) * reference + np.sin(angle) * tangent)
                 theta = np.linspace(0, 2 * np.pi, 97)
-                mesh = pv.lines_from_points(np.asarray([center + length * (np.cos(t) * reference + np.sin(t) * tangent) for t in theta]))
-                self.plotter.add_mesh(mesh, name=name, color=self.colors[key], line_width=3,
-                                      pickable=False, reset_camera=False, render=False)
+                points = center + length * (np.cos(theta)[:, None] * reference + np.sin(theta)[:, None] * tangent)
             else:
                 factor = self.dialog.controls['factor'].value()
                 handle_point = center + np.array([length * max(factor, .05), 0, 0])
-                mesh = pv.Line(center, handle_point)
-                self.plotter.add_mesh(mesh, name=name, color=self.colors[key], line_width=3,
-                                      pickable=False, reset_camera=False, render=False)
+                points = (center, handle_point)
+            update_handle_line(self.plotter, name, points, self.colors[key])
+            if self.mode == 'rotate':
+                update_ring_knob(self.plotter, name + '_knob', handle_point)
             self.representations[key].SetWorldPosition(tuple(handle_point))
-        self.plotter.render()
+        if render:
+            self.plotter.render()
 
     def cursor_ring_angle(self, key):
         center, length = self.center_and_size()
@@ -376,31 +502,30 @@ class ParameterHandles:
             renderer.SetWorldPoint(float(point[0]), float(point[1]), float(point[2]), 1.0)
             renderer.WorldToDisplay()
             return renderer.GetDisplayPoint()
-        return projected_ring_angle(self.plotter.iren.get_event_position(), project(center),
+        return projected_ring_angle(cursor_position(self), project(center),
                                     project(center + length * first), project(center + length * second))
 
     def start_drag(self, key):
         field = self.dialog.controls['r' + key] if self.mode == 'rotate' else self.dialog.controls['factor']
         ring_angle = self.cursor_ring_angle(key) if self.mode == 'rotate' else None
+        self._ring_previous, self._ring_total = ring_angle, 0.
+        self._ring_last_cursor = tuple(cursor_position(self))
         center, length = self.center_and_size()
         projection = axis_drag_projection(self.plotter, center + np.array([length*max(field.value(),.05),0,0]), np.array([1.,0,0])) if self.mode == 'scale' else None
-        self.drag_start = (key, tuple(self.plotter.iren.get_event_position()), field.value(), ring_angle, projection, length)
+        self.drag_start = (key, tuple(cursor_position(self)), field.value(), ring_angle, projection, length)
 
     def drag(self, key):
         if self.drag_start is None or self.drag_start[0] != key:
             return
         _, start, initial, start_angle, projection, length = self.drag_start
-        dy = self.plotter.iren.get_event_position()[1] - start[1]
+        cursor = tuple(cursor_position(self))
         field = self.dialog.controls['r' + key] if self.mode == 'rotate' else self.dialog.controls['factor']
         current_angle = self.cursor_ring_angle(key) if self.mode == 'rotate' else None
-        if start_angle is not None and current_angle is not None:
-            delta = (current_angle - start_angle + 180) % 360 - 180
-            value = initial + delta
-        elif self.mode == 'rotate':
-            value = initial + dy * .5
+        if self.mode == 'rotate':
+            value = initial + ring_drag_delta(self, start_angle, current_angle, start, cursor)
         else:
             a, b, projected_length = projection
-            value = initial + projected_axis_delta(start, self.plotter.iren.get_event_position(), a, b, projected_length) / length
+            value = initial + projected_axis_delta(start, cursor_position(self), a, b, projected_length) / length
         self.updating = True
         try:
             field.setValue(value)
@@ -410,22 +535,28 @@ class ParameterHandles:
 
     def end_drag(self):
         self.drag_start = None
-        stop_handle_sync(self)
-        self.sync()
+        self._ring_last_cursor = None
+        finish_handle_drag(self)
 
     def close(self):
         stop_handle_sync(self)
+        self._camera_timer.stop()
+        self.plotter.camera.RemoveObserver(self._camera_observer)
         for key in self.keys:
             self.widgets[key].EnabledOff()
             self.widgets[key].RemoveAllObservers()
-            self.plotter.remove_actor('parameter_handle_' + self.mode + key, render=False)
+            remove_handle_line(self.plotter, 'parameter_handle_' + self.mode + key)
+            if self.mode == 'rotate':
+                remove_handle_line(self.plotter, 'parameter_handle_' + self.mode + key + '_knob')
         self.plotter.render()
 
 
 class CompositeHandles:
     def __init__(self, *handles): self.handles = handles
-    def sync(self):
-        for handle in self.handles: handle.sync()
+    def sync(self, render=True):
+        for handle in self.handles: handle.sync(render=False)
+        if render and self.handles:
+            self.handles[0].plotter.render()
     def close(self):
         for handle in self.handles: handle.close()
 
@@ -437,11 +568,18 @@ class OperationHandle:
         self.axis, self.angle, self.index = axis, angle, index
         self.drag_start, self.updating = None, False
         self.name = f'operation_handle_{id(self)}'
+        self.hit_filter = None
+        if not angle and hasattr(self.plotter, 'installEventFilter'):
+            from UI.main.arrow_hit_filter import ArrowHitFilter
+            self.hit_filter = ArrowHitFilter(self)
         self.rep = vtk.vtkPointHandleRepresentation3D()
         self.rep.SetHandleSize(12)
         self.rep.GetProperty().SetColor(.22, .57, .82)
         self.rep.GetSelectedProperty().SetColor(.65, .85, 1.)
         if not angle:
+            self.rep.GetProperty().SetOpacity(0.)
+            self.rep.GetSelectedProperty().SetOpacity(0.)
+        else:
             self.rep.GetProperty().SetOpacity(.01)
             self.rep.GetSelectedProperty().SetOpacity(.01)
         self.widget = vtk.vtkHandleWidget()
@@ -453,9 +591,10 @@ class OperationHandle:
         try:
             self.widget.EnabledOn()
             self.sync()
-            if not self.angle:
-                observe_arrow_camera(self)
+            observe_arrow_camera(self)
         except Exception:
+            if self.hit_filter is not None:
+                self.hit_filter.dispose()
             self.widget.EnabledOff()
             self.widget.RemoveAllObservers()
             remove_outline_arrow(self.plotter, self.name)
@@ -464,8 +603,8 @@ class OperationHandle:
     def geometry(self):
         manager, dialog = self.dialog.manager, self.dialog
         if isinstance(self.axis, str) and self.axis == 'revolve':
-            direction = manager.u_axis if dialog.axis.currentData() == 'horizontal' else manager.v_axis
-            center = np.asarray(manager.active_center, dtype=float)
+            center, direction = manager.revolution_axis_geometry(dialog.index, dialog.current_axis())
+            center = np.asarray(center, dtype=float)
         else:
             if self.axis == 'pattern':
                 axis = dialog.controls['axis'].currentText()
@@ -497,10 +636,10 @@ class OperationHandle:
                                        (box.min.Z + box.max.Z) / 2])
             else:
                 center = np.zeros(3)
-        direction = np.asarray(direction, dtype=float)
+        direction = np.array(direction, dtype=float)
         direction /= np.linalg.norm(direction)
         height = self.plotter.ren_win.GetSize()[1]
-        length = max(world_per_pixel(self.plotter.camera, height) * (65 + 18 * self.index), 1e-6)
+        length = max(world_per_pixel(self.plotter.camera, height, center) * (65 + 18 * self.index), 1e-6)
         return center, direction, length
 
     def ring_basis(self):
@@ -510,30 +649,37 @@ class OperationHandle:
         first /= np.linalg.norm(first)
         return center, axis, length, first, np.cross(axis, first)
 
-    def sync(self):
+    def sync(self, render=True):
         if self.updating:
             return
         enabled = self.field.isEnabled()
         self.widget.SetEnabled(enabled)
         if not enabled:
+            if self.hit_filter is not None: self.hit_filter.segments.clear()
             remove_outline_arrow(self.plotter, self.name)
-            self.plotter.render()
+            if self.angle:
+                remove_handle_line(self.plotter, self.name)
+                remove_handle_line(self.plotter, self.name + '_knob')
+            if render:
+                self.plotter.render()
             return
         if self.angle:
-            self.plotter.remove_actor(self.name, render=False)
             center, axis, length, first, second = self.ring_basis()
             theta = np.linspace(0, 2 * np.pi, 97)
-            mesh = pv.lines_from_points(np.asarray([center + length * (np.cos(t) * first + np.sin(t) * second) for t in theta]))
+            points = center + length * (np.cos(theta)[:, None] * first + np.sin(theta)[:, None] * second)
             value = np.radians(self.field.value())
             point = center + length * (np.cos(value) * first + np.sin(value) * second)
-            self.plotter.add_mesh(mesh, name=self.name, color='#f2a13b', line_width=3,
-                                  pickable=False, reset_camera=False, render=False)
+            update_handle_line(self.plotter, self.name, points, '#a5adb2')
+            update_ring_knob(self.plotter, self.name + '_knob', point)
         else:
             center, direction, length = self.geometry()
             point = center + direction * (length + self.field.value())
             add_outline_arrow(self.plotter, self.name, center, point, direction, length * .22)
+            if self.hit_filter is not None:
+                self.hit_filter.segments['primary'] = (center, point)
         self.rep.SetWorldPosition(tuple(point))
-        self.plotter.render()
+        if render:
+            self.plotter.render()
 
     def cursor_angle(self):
         center, _, length, first, second = self.ring_basis()
@@ -542,29 +688,30 @@ class OperationHandle:
             renderer.SetWorldPoint(float(point[0]), float(point[1]), float(point[2]), 1.)
             renderer.WorldToDisplay()
             return renderer.GetDisplayPoint()
-        return projected_ring_angle(self.plotter.iren.get_event_position(), project(center),
+        return projected_ring_angle(cursor_position(self), project(center),
                                     project(center + length * first), project(center + length * second))
 
     def start_drag(self, *args):
         center, direction, length = self.geometry()
         point = center + direction * (length + self.field.value())
-        self.drag_start = (tuple(self.plotter.iren.get_event_position()), self.field.value(),
-                           self.cursor_angle() if self.angle else None,
+        ring_angle = self.cursor_angle() if self.angle else None
+        self._ring_previous, self._ring_total = ring_angle, 0.
+        self._ring_last_cursor = tuple(cursor_position(self))
+        self.drag_start = (tuple(cursor_position(self)), self.field.value(),
+                           ring_angle,
                            None if self.angle else axis_drag_projection(self.plotter, point, direction))
 
     def drag(self, *args):
         if self.drag_start is None:
             return
         start, initial, start_angle, projection = self.drag_start
-        dy = self.plotter.iren.get_event_position()[1] - start[1]
+        cursor = tuple(cursor_position(self))
         current = self.cursor_angle() if self.angle else None
-        if start_angle is not None and current is not None:
-            value = initial + ((current - start_angle + 180) % 360 - 180)
-        elif self.angle:
-            value = initial + dy * .5
+        if self.angle:
+            value = initial + ring_drag_delta(self, start_angle, current, start, cursor)
         else:
             a, b, length = projection
-            value = initial + projected_axis_delta(start, self.plotter.iren.get_event_position(), a, b, length)
+            value = initial + projected_axis_delta(start, cursor_position(self), a, b, length)
         self.updating = True
         try:
             self.field.setValue(value)
@@ -574,17 +721,21 @@ class OperationHandle:
 
     def end_drag(self, *args):
         self.drag_start = None
-        stop_handle_sync(self)
-        self.sync()
+        self._ring_last_cursor = None
+        finish_handle_drag(self)
 
     def close(self):
         stop_handle_sync(self)
+        if getattr(self, 'hit_filter', None) is not None: self.hit_filter.dispose()
         if hasattr(self, '_camera_observer'):
             self._camera_timer.stop()
             self.plotter.camera.RemoveObserver(self._camera_observer)
         self.widget.EnabledOff()
         self.widget.RemoveAllObservers()
         remove_outline_arrow(self.plotter, self.name)
+        if getattr(self, 'angle', False):
+            remove_handle_line(self.plotter, self.name)
+            remove_handle_line(self.plotter, self.name + '_knob')
         self.plotter.render()
 
 

@@ -37,7 +37,7 @@ class SceneSketchCommands(ParametricSketchDialog):
         self.manager.history_edit_graph = self.graph
         feature = self.feature()
         state = self.graph.results[self.feature_id].constraint_status
-        self.handles = {name:_Point(point) for name, point in state.points.items()}
+        self.handles = {name: _Point(point) for name, point in state.points.items()} if state is not None else {}
         self.lines, self.circles, self.arcs, self.arc_entities = [], [], [], []
         self.ellipses, self.splines, self.periodic_splines = [], [], []
         self.slots, self.polyline_slots, self.arc_slots, self.spline_slots, self.composite_slots = [], [], [], [], []

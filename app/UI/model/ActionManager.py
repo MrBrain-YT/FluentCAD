@@ -20,8 +20,10 @@ from UI.model.tools.Curve import Curve
 from UI.model.tools.Ellipse import Ellipse
 from UI.model.tools.StraightShape import StraightShape
 from UI.model.tools.Spline import Spline
-from UI.model.profiles import build_profiles, sketch_edges, split_edges
+from UI.model.profiles import build_profiles, indexed_sketch_edges, sketch_edges, split_edges
 from UI.model.solid_operations import build_extrusion, build_revolution, build_primitive
+from UI.model.operation_geometry import extrusion_target, revolution_axis
+from UI.model.geometry_references import make_reference
 from UI.model.edge_selection import nearest_screen_edge, face_edge_indices
 from UI.model.sketch_constraints import line_points, add_automatic_coincidences
 from UI.model.transforms import body_index_for_face
@@ -47,14 +49,21 @@ class ActionManager():
         self.timeline = Timeline()
         self.parametric_graph = None
         self.parametric_sketch_id = None
+        self.spatial_sketch_id = None
+        self.sketch_spatial_actors = []
         self.history_edit_id = None
         self.history_edit_graph = None
         self.history_origin_is_new = False
         self.history_edit_actors = []
         self.history_point_actors = {}
+        self.history_mirror_point_actors = {}
+        self.history_entity_actors = {}
+        self.history_segment_actors = {}
+        self.history_dimension_labels = {}
+        self.sketch_modifier = None
+        self.history_selection = None
         self.history_drag_name = None
         self.history_drag_start = None
-        self.previous_sketch_style = None
         self.sketch_plane_support = None
         self.graph_undo = []
         self.graph_redo = []
@@ -69,9 +78,11 @@ class ActionManager():
         self.constraint_glyph_actor = None
         self.selecting_sketch_plane = False
         self.profile_selection_callback = None
+        self.selecting_multiple_profiles = False
         self.selected_profile_index = None
         self.edge_selection_mode = False
         self.interaction_locked = False
+        self.operation_scene_click = None
         self.selected_edge_indices = set()
         self.edge_selection_actors = []
         self.status_callback = lambda message: None
@@ -90,7 +101,7 @@ class ActionManager():
         self.selected_actor_name = None  # Имя текущего выделенного объекта
         
         self.sketch_profiles = []    # Список мешей (актеров) профилей на сцене
-        self.selected_profiles = set() # Множество имен выбранных профилей
+        self.selected_profile_indices = []
         
         self.cell_picker = vtk.vtkCellPicker()
         self.cell_picker.SetTolerance(0.0005)
@@ -100,21 +111,27 @@ class ActionManager():
         
         self.highlight_actor = None
         self.selected_face_id = -1
+        self.selected_face_ids = set()
         
     def activate_sketch_mode(self):
+        self._clear_sketch_spatial_actors()
         self.sketch_plane_support = None
         self.clear_selected_edges()
         self.edge_selection_mode = False
         self.profile_selection_callback = None
+        self.selecting_multiple_profiles = False
         self.selecting_sketch_plane = True
         self.selected_face_id = -1
+        self.selected_face_ids.clear()
         self._clear_highlight()
         for profile in self.profiles:
             self.plotter.remove_actor(profile["name"])
         self.profiles = []
         self.selected_profile_index = None
+        self.selected_profile_indices.clear()
         self.show_origin_planes()
         self.set_construction_planes_visible(True)
+        self.timeline_callback()
         self.status_callback("Select an origin plane, construction plane, or planar face.")
 
     def cancel_pending_selection(self):
@@ -124,10 +141,12 @@ class ActionManager():
                 self.plotter.remove_actor(name)
             self.start_helper_planes.clear()
             self.set_construction_planes_visible(False)
+            self.timeline_callback()
             self.status_callback("Plane selection cancelled.")
             return True
         if self.profile_selection_callback is not None:
             self.profile_selection_callback = None
+            self.selecting_multiple_profiles = False
             self.status_callback("Profile selection cancelled.")
             return True
         if self.edge_selection_mode:
@@ -136,16 +155,29 @@ class ActionManager():
             return True
         return False
 
-    def request_profile_selection(self, callback):
+    def request_profile_selection(self, callback, multiple=False):
         self.profile_selection_callback = callback
-        self.status_callback("Click a sketch profile to continue.")
+        self.selecting_multiple_profiles = multiple
+        self.status_callback("Click profiles to toggle selection. Press Enter to apply." if multiple
+                             else "Click a sketch profile to continue.")
 
-    def _pick_actor(self, actors):
+    def finish_profile_selection(self):
+        if not self.selecting_multiple_profiles or self.profile_selection_callback is None:
+            return False
+        if not self.selected_profile_indices:
+            self.status_callback('Select at least one profile.')
+            return True
+        callback, self.profile_selection_callback = self.profile_selection_callback, None
+        self.selecting_multiple_profiles = False
+        callback(tuple(self.selected_profile_indices))
+        return True
+
+    def _pick_actor(self, actors, tolerance=0.0005):
         actors = [actor for actor in actors if actor is not None]
         if not actors:
             return None
         picker = vtk.vtkCellPicker()
-        picker.SetTolerance(0.0005)
+        picker.SetTolerance(tolerance)
         picker.PickFromListOn()
         for actor in actors:
             picker.AddPickList(actor)
@@ -179,7 +211,7 @@ class ActionManager():
                     self.status_callback('Cannot identify the parametric face source.')
                     return
                 try:
-                    reference = make_reference(source_id, self.current_part, 'face', face_id)
+                    reference = make_reference(source_id, self.current_part, 'face', face_id, self.parametric_graph.body_names.get(source_id))
                 except ValueError as exc:
                     self.status_callback(str(exc))
                     return
@@ -192,7 +224,7 @@ class ActionManager():
             mesh = pv.wrap(actor.GetMapper().GetInput())
             self.on_plane_selected(mesh)
 
-    def _select_profile(self):
+    def _select_profile(self, toggle=False):
         actors = [self.plotter.actors.get(profile["name"]) for profile in self.profiles]
         picker = self._pick_actor(actors)
         if picker is None:
@@ -201,15 +233,26 @@ class ActionManager():
         index = next((i for i, candidate in enumerate(actors) if candidate == actor), None)
         if index is None:
             return False
-        self.selected_profile_index = index
+        if self.profile_selection_callback is not None and not self.selecting_multiple_profiles:
+            self.selected_profile_indices = [index]
+        elif toggle or self.selecting_multiple_profiles or self.control_modifier_active():
+            if index in self.selected_profile_indices:
+                self.selected_profile_indices.remove(index)
+            else:
+                self.selected_profile_indices.append(index)
+        else:
+            self.selected_profile_indices = [index]
+        self.selected_profile_index = self.selected_profile_indices[0] if self.selected_profile_indices else None
         for i, candidate in enumerate(actors):
             if candidate is not None:
-                candidate.prop.color = "#f39c12" if i == index else "#3498db"
-                candidate.prop.opacity = 0.7 if i == index else 0.45
+                selected = i in self.selected_profile_indices
+                candidate.prop.color = "#f39c12" if selected else "#3498db"
+                candidate.prop.opacity = 0.7 if selected else 0.45
         self.plotter.render()
-        self.status_callback("Profile selected. Choose a solid operation.")
+        instruction = 'Press Enter to apply.' if self.selecting_multiple_profiles else 'Ctrl-click to change the selection.'
+        self.status_callback(f"Profiles selected: {len(self.selected_profile_indices)}. {instruction}")
         callback = self.profile_selection_callback
-        if callback is not None:
+        if callback is not None and not self.selecting_multiple_profiles:
             self.profile_selection_callback = None
             callback(index)
         return True
@@ -272,13 +315,13 @@ class ActionManager():
     def get_current_sketch_data(self):
         return self.sketchs_data.get(self.activated_sketch_id)
 
-    def _get_face_under_mouse(self):
+    def _get_face_under_mouse(self, actor=None):
         # Исправляем координаты для 4K мониторов и масштабирования Windows
         # (Важно: берем координаты напрямую из интеркатора)
         x, y = self.plotter.iren.get_event_position()
         
         # Обновляем "белый список" объектов для поиска
-        main_actor = self.plotter.actors.get("main_part")
+        main_actor = self.plotter.actors.get("main_part") if actor is None else actor
         if not main_actor: return -1, None
         
         self.cell_picker.InitializePickList()
@@ -302,12 +345,8 @@ class ActionManager():
 
     def update_plotter(self, plotter):
         self.plotter: Union[QtInteractor, pv.Plotter] = plotter
-        self.plotter.iren.add_observer(
-            "MouseWheelForwardEvent", self.update_grid_lod
-        )
-        self.plotter.iren.add_observer(
-            "MouseWheelBackwardEvent", self.update_grid_lod
-        )
+        # Qt handles camera gestures. VTK still supplies selection and drawing events.
+        self.plotter.iren.style = vtk.vtkInteractorStyleUser()
 
         # Создаем второй рендерер для подсветки
         self.highlight_renderer = vtk.vtkRenderer()
@@ -322,6 +361,7 @@ class ActionManager():
 
         # Синхронизируем камеру (ВАЖНО: после AddRenderer)
         self.highlight_renderer.SetActiveCamera(self.plotter.renderer.GetActiveCamera())
+        self.plotter._fluent_overlay_renderer = self.highlight_renderer
 
         # Add event listener
         self.plotter.iren.add_observer("MouseMoveEvent", self._on_hover)
@@ -348,19 +388,6 @@ class ActionManager():
         iren = getattr(self.plotter, 'iren', None)
         interactor = getattr(iren, 'interactor', None)
         return bool(interactor.GetControlKey()) if interactor is not None else False
-
-    def lock_sketch_camera(self):
-        iren = getattr(self.plotter, 'iren', None)
-        if iren is None or not hasattr(iren, 'style') or self.previous_sketch_style is not None:
-            return
-        from UI.model.sketch_navigation import SketchCameraStyle
-        self.previous_sketch_style = iren.style
-        iren.style = SketchCameraStyle(self)
-
-    def restore_camera_style(self):
-        if self.previous_sketch_style is None: return
-        self.plotter.iren.style = self.previous_sketch_style
-        self.previous_sketch_style = None
 
     def _pick_face(self):
         main_actor = self.plotter.actors.get("main_part")
@@ -397,6 +424,13 @@ class ActionManager():
     def _on_hover(self, *args):
         """Белая подсветка при наведении"""
         # Sketch interaction and profile picking have priority over solid highlighting.
+        if self.sketch_modifier is not None:
+            if self.control_modifier_active():
+                self.sketch_modifier.clear_preview()
+                self.sketch_modifier.preview_key = None
+            else:
+                self.sketch_modifier.hover()
+            return
         if self.interaction_locked or self.sketch_editing or self.selecting_sketch_plane or self.profile_selection_callback or self.edge_selection_mode:
             return
         if self.selected_face_id != -1:
@@ -416,12 +450,17 @@ class ActionManager():
 
     def _on_click(self, *args):
         if self.interaction_locked:
+            if self.operation_scene_click is not None:
+                self.operation_scene_click()
             return
         if self.selecting_sketch_plane:
             self._select_sketch_plane()
             return
         if self.sketch_editing:
             if self.control_modifier_active():
+                return
+            if self.sketch_modifier is not None:
+                self.sketch_modifier.apply()
                 return
             if self.history_edit_id is not None and (self.active_tool is None or not self.active_tool.is_drawing):
                 self.active_tool = None
@@ -436,11 +475,29 @@ class ActionManager():
             return
         face_id, face_mesh = self._pick_face()
         if face_id == -1:
+            if self.control_modifier_active():
+                return
             self.selected_face_id = -1
+            self.selected_face_ids.clear()
             self.hover_id = -1
             self._clear_highlight()
             return
-        self.selected_face_id = face_id
+        face_id = int(face_id)
+        if self.control_modifier_active():
+            if face_id in self.selected_face_ids:
+                self.selected_face_ids.remove(face_id)
+            else:
+                self.selected_face_ids.add(face_id)
+        else:
+            self.selected_face_ids = {face_id}
+        self.selected_face_id = face_id if face_id in self.selected_face_ids else next(iter(self.selected_face_ids), -1)
+        if not self.selected_face_ids:
+            self._clear_highlight()
+            return
+        if len(self.selected_face_ids) > 1 or face_id not in self.selected_face_ids:
+            mesh = self.plotter.actors['main_part'].mapper.dataset
+            mask = np.isin(mesh.cell_data['face_id'], list(self.selected_face_ids))
+            face_mesh = mesh.extract_cells(np.flatnonzero(mask)).extract_surface(algorithm='dataset_surface')
         self._draw_highlight(face_mesh, color=[101, 164, 252], opacity=0.3)
 
     def selected_body_index(self):
@@ -474,6 +531,7 @@ class ActionManager():
             raise ValueError("Finish the current sketch and solid operation first.")
         self.edge_selection_mode = True
         self.selected_face_id = -1
+        self.selected_face_ids.clear()
         self.hover_id = -1
         self._clear_highlight()
         self.status_callback("Click edges to select or deselect them; press Esc to finish selection.")
@@ -486,19 +544,27 @@ class ActionManager():
         if self.plotter is not None:
             self.plotter.render()
 
-    def select_edge_at_cursor(self):
+    def _edge_at_cursor(self, straight_only=False):
         face_index, _ = self._get_face_under_mouse()
         if face_index < 0 or self.current_part is None:
-            return
+            return None
         edges, candidates = face_edge_indices(self.current_part, face_index)
+        if straight_only:
+            candidates = [index for index in candidates if edges[index].geom_type == cad_core.GeomType.LINE]
+        return self._nearest_edge(edges, candidates, samples=2 if straight_only else 65)
+
+    def _nearest_edge(self, edges, candidates, samples=65):
         if not candidates:
-            return
+            return None
         renderer = self.plotter.renderer
         def project(point):
             renderer.SetWorldPoint(float(point[0]), float(point[1]), float(point[2]), 1.0)
             renderer.WorldToDisplay()
             return renderer.GetDisplayPoint()
-        index = nearest_screen_edge(edges, candidates, self.plotter.iren.get_event_position(), project)
+        return nearest_screen_edge(edges, candidates, self.plotter.iren.get_event_position(), project, samples=samples)
+
+    def select_edge_at_cursor(self):
+        index = self._edge_at_cursor()
         if index is None:
             self.status_callback("Click closer to an edge.")
             return
@@ -606,7 +672,6 @@ class ActionManager():
         for tool in self.get_current_sketch_data()["sketch_func"]:
             tool.is_drawing = False
         self.sketch_editing = False
-        self.restore_camera_style()
         if graph is not None:
             self.install_parametric_graph(graph)
             self.parametric_sketch_id = sketch_feature.id
@@ -623,12 +688,14 @@ class ActionManager():
         candidate = FeatureGraph.from_data(self.parametric_graph.to_data())
         feature = next((item for item in candidate.features if item.id == feature_id), None)
         sketch = candidate.results.get(feature_id)
-        if feature is None or feature.kind != 'planar_sketch' or sketch is None or sketch.constraint_status is None:
-            raise ValueError('This sketch needs active named points for scene editing.')
+        if feature is None or feature.kind != 'planar_sketch' or sketch is None:
+            raise ValueError('Choose an active parametric sketch.')
+        self._clear_sketch_spatial_actors()
         for profile in self.profiles:
             self.plotter.remove_actor(profile['name'])
         self.profiles = []
         self.selected_profile_index = None
+        self.selected_profile_indices.clear()
         for actor in self.sketch_edge_actors:
             self.plotter.remove_actor(actor, render=False)
         self.sketch_edge_actors = []
@@ -637,6 +704,7 @@ class ActionManager():
                 for actor in tool.render_obj['points']:
                     self.plotter.remove_actor(actor, render=False)
         self.history_edit_id, self.history_edit_graph = feature_id, candidate
+        self.history_selection = None
         self.history_origin_is_new = False
         self.active_center = np.asarray(tuple(sketch.plane.origin), dtype=float)
         self.active_normal = np.asarray(tuple(sketch.plane.z_dir), dtype=float)
@@ -651,7 +719,6 @@ class ActionManager():
         body = self.plotter.actors.get('main_part')
         if body is not None: body.SetVisibility(False)
         try:
-            self.lock_sketch_camera()
             self.align_camera_to_normal(self.active_normal)
             self.update_grid_lod()
             self.render_history_sketch()
@@ -660,7 +727,7 @@ class ActionManager():
             raise
         self.status_callback('Drag sketch points, add geometry, then finish. Esc cancels when no tool is active.')
 
-    def promote_current_sketch(self):
+    def promote_current_sketch(self, allow_empty=False):
         if not self.sketch_editing or self.history_edit_id is not None:
             raise ValueError('Start a new sketch first.')
         if self.parametric_graph is None and self.current_part is not None:
@@ -668,7 +735,7 @@ class ActionManager():
         from UI.model.sketch_capture import capture_sketch
         sketch_data = self.get_current_sketch_data()
         definition = capture_sketch(sketch_data, self.active_center, self.u_axis, self.v_axis)
-        if not definition['points']:
+        if not definition['points'] and not allow_empty:
             raise ValueError('Draw sketch geometry before using this command.')
         args = {'origin':self.active_center.tolist(), 'normal':self.active_normal.tolist(), 'x_dir':self.u_axis.tolist()}
         support = None
@@ -678,6 +745,7 @@ class ActionManager():
         previous = self.parametric_graph
         candidate = FeatureGraph([*(previous.features if previous else []),plane,feature], previous.parameters if previous else {})
         self.history_edit_id, self.history_edit_graph = feature.id, candidate
+        self.history_selection = None
         self.history_origin_is_new = True
         try:
             self.render_history_sketch()
@@ -705,17 +773,167 @@ class ActionManager():
             self.plotter.remove_actor(actor, render=False)
         self.history_edit_actors = []
         self.history_point_actors = {}
+        self.history_mirror_point_actors = {}
+        self.history_entity_actors = {}
+        self.history_segment_actors = {}
+        self.history_dimension_labels = {}
 
-    def render_history_sketch(self):
+    def _prepare_named_sketch(self):
+        if not self.sketch_editing:
+            raise ValueError('Select a sketch plane first.')
+        if self.history_edit_id is None:
+            self.promote_current_sketch()
+        else:
+            self.flush_history_tools()
+
+    def start_sketch_constraint(self, mode):
+        from UI.model.sketch_constraint_session import SketchConstraintSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchConstraintSession(self, mode)
+        self.status_callback(self.sketch_modifier.prompt())
+
+    def start_sketch_dimension(self, mode, edit_value):
+        from UI.model.sketch_dimension_session import SketchDimensionSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchDimensionSession(self, mode, edit_value)
+        self.status_callback(self.sketch_modifier.prompt())
+
+    def start_sketch_modifier(self, command, distance):
+        from UI.model.sketch_modify_session import SketchModifySession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchModifySession(self, command, distance)
+        self.status_callback(f'{command.title()}: hover over a segment to preview.')
+
+    def start_sketch_offset(self, distance, chain_selection, corner_mode=None):
+        from UI.model.sketch_offset_session import SketchOffsetSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchOffsetSession(self, distance, chain_selection, corner_mode)
+        self.status_callback(self.sketch_modifier.prompt)
+
+    def start_sketch_corner(self, command, size):
+        from UI.model.sketch_corner_session import SketchCornerSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchCornerSession(self, command, size)
+        self.status_callback(self.sketch_modifier.prompt)
+
+    def start_sketch_mirror(self):
+        from UI.model.sketch_mirror_session import SketchMirrorSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchMirrorSession(self)
+        self.status_callback(self.sketch_modifier.prompt)
+
+    def start_sketch_move(self, settings):
+        from UI.model.sketch_move_session import SketchMoveSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchMoveSession(self, settings)
+        self.status_callback(self.sketch_modifier.prompt)
+
+    def start_sketch_scale(self, factor):
+        from UI.model.sketch_scale_session import SketchScaleSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchScaleSession(self, factor)
+        self.status_callback(self.sketch_modifier.prompt)
+
+    def start_sketch_pattern(self, kind, settings):
+        from UI.model.sketch_pattern_session import SketchPatternSession
+        self._prepare_named_sketch()
+        self.sketch_modifier = SketchPatternSession(self, kind, settings)
+        self.status_callback(self.sketch_modifier.prompt)
+
+    def stop_sketch_modifier(self):
+        if self.sketch_modifier is None:
+            return False
+        self.sketch_modifier.close()
+        self.sketch_modifier = None
+        self.status_callback('Sketch tool stopped.')
+        return True
+
+    def sketch_link_sources(self, kind=None):
+        graph = self.history_edit_graph if self.history_edit_id is not None else self.parametric_graph
+        if graph is None:
+            return []
+        features = graph.features
+        if self.history_edit_id is not None:
+            position = next(i for i, feature in enumerate(features) if feature.id == self.history_edit_id)
+            features = features[:position]
+        if kind == 'sketch_curve':
+            from UI.model.sketch_projection_curves import projectable_sketch_curves
+            return [feature for feature in reversed(features)
+                    if feature.kind in ('planar_sketch', 'rectangle_sketch')
+                    and projectable_sketch_curves(graph.results.get(feature.id))]
+        return [feature for feature in reversed(features)
+                if hasattr(result := graph.results.get(feature.id), 'solids') and result.solids()]
+
+    def start_sketch_link(self, command, kind, source_id=None, replace_id=None):
+        from UI.model.sketch_link_session import SketchLinkSession
+        if not self.sketch_editing:
+            raise ValueError('Select a sketch plane first.')
+        if replace_id is not None:
+            graph = self.history_edit_graph
+            feature = next((item for item in graph.features if item.id == self.history_edit_id), None) if graph else None
+            if feature is None or not any(item['id'] == replace_id and item['operation'] == command and item['kind'] == kind
+                                          for item in feature.parameters.get('links', [])):
+                raise ValueError('Select a matching sketch link to repair.')
+        sources = self.sketch_link_sources(kind)
+        source_label = 'sketch with curves' if kind == 'sketch_curve' else 'solid'
+        if not sources:
+            raise ValueError(f'This command needs an earlier {source_label} in the Timeline.')
+        source_id = source_id or sources[0].id
+        if not any(feature.id == source_id for feature in sources):
+            raise ValueError(f'Choose a {source_label} from before this sketch.')
+        if self.history_edit_id is None:
+            self.promote_current_sketch(allow_empty=True)
+        else:
+            self.flush_history_tools()
+        self.sketch_modifier = SketchLinkSession(self, command, kind, source_id, replace_id)
+        entity = 'sketch curve' if kind == 'sketch_curve' else kind
+        self.status_callback(f'{command.title()}: hover over a {entity} on the replacement source.' if replace_id
+                             else f'{command.title()}: hover over a source {entity} to preview.')
+
+    def break_sketch_link(self, link_id):
+        if not self.sketch_editing or self.history_edit_id is None:
+            raise ValueError('Edit a sketch with linked geometry first.')
+        graph, feature_id = self.history_edit_graph, self.history_edit_id
+        params = next(feature.parameters for feature in graph.features if feature.id == feature_id)
+        links = params.get('links', [])
+        link = next((item for item in links if item['id'] == link_id), None)
+        if link is None or 'fallback' not in link:
+            raise ValueError('This link has no saved geometry to keep.')
+        params['links'] = [item for item in links if item['id'] != link_id]
+        params.setdefault('detached_links', []).append({'id': link_id, 'geometry': link['fallback']})
+        candidate = FeatureGraph.from_data(graph.to_data())
+        candidate.edit(feature_id, parameters=params)
+        self.history_edit_graph = candidate
+        self.history_selection = None
+        self.render_history_sketch()
+        self.status_callback('Link broken. The curves and points remain in the sketch.')
+
+    def draw_sketch_edge(self, edge, color, width, pickable=True):
+        count = max(2, min(257, int(edge.length * 8) + 2))
+        if edge.geom_type != cad_core.GeomType.LINE:
+            count = max(33, count)
+        vertices = np.asarray([tuple(edge.position_at(t)) for t in np.linspace(0, 1, count)])
+        return self.plotter.add_mesh(pv.lines_from_points(vertices), color=color, line_width=width,
+                                     pickable=pickable, reset_camera=False, render=False)
+
+    def render_history_sketch(self, graph=None):
+        from UI.model.curve_spans import CURVE_TYPES
+        from UI.model.feature_graph import resolve_parameters
+        from UI.model.sketch_dimensions import DIMENSION_NAMES, dimension_annotation
+        from UI.model.sketch_dimension_session import draw_dimension
+
         self.clear_history_sketch_actors()
-        sketch = self.history_edit_graph.results[self.history_edit_id]
-        for tool in sketch.tools:
-            for edge in sketch_edges([tool], self.active_normal):
-                count = max(2, min(257, int(edge.length * 8) + 2))
-                mesh = pv.lines_from_points(np.asarray([tuple(edge.position_at(t)) for t in np.linspace(0, 1, count)]))
-                actor = self.plotter.add_mesh(mesh, color='#43889d' if tool.is_construction else 'blue',
-                                              line_width=2, pickable=False, reset_camera=False, render=False)
+        graph = self.history_edit_graph if graph is None else graph
+        sketch = graph.results[self.history_edit_id]
+        for entity_index, tool in enumerate(sketch.tools):
+            editable = tool.type in CURVE_TYPES or tool.type in ('line', 'curve', 'circle')
+            for segment, edge in indexed_sketch_edges(tool, self.active_normal):
+                selected = self.history_selection == ('entity', entity_index)
+                color = '#ffb33b' if selected else ('#43889d' if tool.is_construction else 'blue')
+                actor = self.draw_sketch_edge(edge, color, 3 if selected else 2)
                 self.history_edit_actors.append(actor)
+                self.history_entity_actors[actor] = entity_index
+                self.history_segment_actors[actor] = (entity_index, segment, edge, editable)
             if tool.type in ('spline','fit_spline','nurbs','periodic_nurbs') and len(tool.points) >= 2:
                 controls = [np.asarray(point, dtype=float) for point in tool.points]
                 if tool.type == 'periodic_nurbs': controls.append(controls[0])
@@ -729,30 +947,73 @@ class ActionManager():
                 actor = self.plotter.add_mesh(mesh, color='#94a5af', line_width=1,
                                               pickable=False, reset_camera=False, render=False)
                 self.history_edit_actors.append(actor)
-        for name, point in sketch.constraint_status.points.items():
+        issues = graph.link_issues.get(self.history_edit_id, {})
+        for name, edge in sketch.corner_edges:
+            actor = self.draw_sketch_edge(edge, '#087f84', 3)
+            self.history_edit_actors.append(actor)
+            self.history_segment_actors[actor] = (-1, name, edge, False)
+        for edges, points, color in ((sketch.linked_edges, sketch.linked_points, '#8c4ac0'),
+                                     (sketch.detached_edges, sketch.detached_points, '#2663a0'),
+                                     (sketch.offset_edges, (), '#087f84'),
+                                     (sketch.mirror_edges, (), '#087f84'),
+                                     (sketch.pattern_edges, (), '#087f84')):
+            for name, edge in edges:
+                off_plane = name in sketch.off_plane_edge_names
+                edge_color = '#087f84' if off_plane else color
+                if name in sketch.mirror_construction_edges or name in sketch.pattern_construction_edges:
+                    edge_color = '#43889d'
+                if name.partition(':')[0] in issues:
+                    edge_color = '#a35a00'
+                actor = self.draw_sketch_edge(edge, edge_color, 3, pickable=not off_plane)
+                self.history_edit_actors.append(actor)
+                if not off_plane:
+                    self.history_segment_actors[actor] = (-1, name, edge, False)
+            if points:
+                self.history_edit_actors.append(self.plotter.add_points(
+                    np.asarray([tuple(point) for point in points]), color=color,
+                    point_size=9, pickable=False, reset_camera=False, render=False,
+                ))
+        for name, point in (*sketch.mirror_points, *sketch.pattern_points):
+            actor = self.plotter.add_points(np.asarray(tuple(point)), color='#087f84', point_size=10,
+                                            pickable=True, reset_camera=False, render=False)
+            self.history_edit_actors.append(actor)
+            self.history_mirror_point_actors[actor] = name
+        state = sketch.constraint_status
+        for name, point in (state.points.items() if state is not None else ()):
             world = self.get_global_pos_in_sketch(point)
-            actor = self.plotter.add_points(world, color='#1785ae', point_size=12, pickable=True,
+            actor = self.plotter.add_points(world, color='#ffb33b' if self.history_selection == ('point', name) else '#1785ae', point_size=12, pickable=True,
                                             reset_camera=False, render=False)
             self.history_edit_actors.append(actor)
             self.history_point_actors[name] = actor
         from UI.model.parametric_sketch import circle_radius_name
-        feature = next(item for item in self.history_edit_graph.features if item.id == self.history_edit_id)
+        feature = next(item for item in graph.features if item.id == self.history_edit_id)
         for index, entity in enumerate(feature.parameters.get('entities', [])):
             if entity.get('type') != 'circle' or not isinstance(entity.get('center'), str): continue
-            center = sketch.constraint_status.points[entity['center']]
-            radius = sketch.constraint_status.radii[circle_radius_name(index)]
+            center = state.points[entity['center']]
+            radius = state.radii[circle_radius_name(index)]
             world = self.get_global_pos_in_sketch(center + np.array([radius, 0.]))
             actor = self.plotter.add_points(world, color='#e39832', point_size=12, pickable=True,
                                             reset_camera=False, render=False)
             self.history_edit_actors.append(actor)
             self.history_point_actors[('radius', index, entity['center'])] = actor
         glyphs, labels = [], []
-        for constraint in feature.parameters.get('constraints', []):
+        variables = resolve_parameters(graph.parameters)
+        for index, constraint in enumerate(feature.parameters.get('constraints', [])):
+            if state is not None and constraint.get('kind') in DIMENSION_NAMES:
+                try:
+                    annotation = dimension_annotation(constraint, state, variables)
+                except ValueError:
+                    pass
+                else:
+                    actors, label = draw_dimension(self, annotation)
+                    self.history_edit_actors.extend(actors)
+                    self.history_dimension_labels[index] = label
+                    continue
             refs = constraint.get('entities', [])
             first = refs[0] if refs else None
             if isinstance(first, (list, tuple)) and first: first = first[0]
-            if not isinstance(first, str) or first not in sketch.constraint_status.points: continue
-            glyphs.append(self.get_global_pos_in_sketch(sketch.constraint_status.points[first]))
+            if state is None or not isinstance(first, str) or first not in state.points: continue
+            glyphs.append(self.get_global_pos_in_sketch(state.points[first]))
             value = constraint.get('value')
             labels.append(str(constraint.get('kind', 'constraint')) + (f' {value}' if value is not None else ''))
         if glyphs and hasattr(self.plotter, 'add_point_labels'):
@@ -764,15 +1025,41 @@ class ActionManager():
     def _begin_history_drag(self):
         self.history_drag_name = self._history_handle_at_cursor()
         self.history_drag_start = self.plotter.iren.get_event_position() if self.history_drag_name is not None else None
+        if isinstance(self.history_drag_name, str):
+            self.history_selection = ('point', self.history_drag_name)
+        elif self.history_drag_name is None:
+            picker = vtk.vtkCellPicker()
+            picker.SetTolerance(.005)
+            picker.PickFromListOn()
+            for actor in self.history_entity_actors: picker.AddPickList(actor)
+            x, y = self.plotter.iren.get_event_position()
+            picker.Pick(x, y, 0, self.plotter.renderer)
+            index = self.history_entity_actors.get(picker.GetActor())
+            self.history_selection = ('entity', index) if index is not None else None
+        else:
+            self.history_selection = None
+        if self.history_drag_name is None:
+            self.render_history_sketch()
+        elif isinstance(self.history_drag_name, str):
+            for name, actor in self.history_point_actors.items():
+                if isinstance(name, str):
+                    actor.GetProperty().SetColor(*((1., .7, .2) if name == self.history_drag_name else (.09, .52, .68)))
+            self.plotter.render()
 
-    def _history_handle_at_cursor(self):
+    def _history_handle_at_cursor(self, named_only=False, excluded=()):
         from UI.model.parametric_sketch import circle_radius_name
         state = self.history_edit_graph.results[self.history_edit_id].constraint_status
+        if state is None:
+            return None
         cursor = np.asarray(self.plotter.iren.get_event_position(), dtype=float)
         renderer = self.plotter.renderer
         nearest, best = None, 12.0
         for name in self.history_point_actors:
+            if name in excluded:
+                continue
             if isinstance(name, tuple):
+                if named_only:
+                    continue
                 point = state.points[name[2]] + np.array([state.radii[circle_radius_name(name[1])], 0.])
             else:
                 point = state.points[name]
@@ -858,17 +1145,19 @@ class ActionManager():
         if new['points'] or new['entities'] or new['constraints']:
             feature = next(item for item in candidate.features if item.id == feature_id)
             params = deepcopy(feature.parameters)
+            points = params.setdefault('points', {})
             mapping = {}
             for name in new['points']:
                 number = 1
-                while f'N{number}_{name}' in params['points']: number += 1
+                while f'N{number}_{name}' in points: number += 1
                 mapping[name] = f'N{number}_{name}'
             def remap(value):
                 if isinstance(value, str): return mapping.get(value, value)
                 if isinstance(value, (tuple, list)): return [remap(item) for item in value]
                 return value
-            params['points'].update({mapping[name]: point for name, point in new['points'].items()})
-            old_points = candidate.results[feature_id].constraint_status.points
+            points.update({mapping[name]: point for name, point in new['points'].items()})
+            state = candidate.results[feature_id].constraint_status
+            old_points = state.points if state is not None else {}
             for name, point in new['points'].items():
                 matching = [old for old, position in old_points.items() if np.linalg.norm(np.asarray(point)-position) < 1e-7]
                 if matching:
@@ -901,6 +1190,7 @@ class ActionManager():
         self.render_history_sketch()
 
     def finish_history_sketch(self):
+        self.stop_sketch_modifier()
         feature_id = self.history_edit_id
         candidate = self.merged_history_graph()
         self.install_parametric_graph(candidate, allow_empty=True)
@@ -915,7 +1205,6 @@ class ActionManager():
         self.plotter.disable_picking()
         self.sketch_editing = False
         self.pending_sketch = False
-        self.restore_camera_style()
         self.history_edit_id = self.history_edit_graph = None
         self.history_origin_is_new = False
         self.history_drag_name = self.history_drag_start = None
@@ -925,6 +1214,7 @@ class ActionManager():
 
     def cancel_history_sketch(self):
         if self.history_edit_id is None: return False
+        self.stop_sketch_modifier()
         feature_id = self.history_edit_id
         was_new = self.history_origin_is_new
         self.clear_history_sketch_actors()
@@ -940,7 +1230,6 @@ class ActionManager():
         self.sketchs_data.pop(self.activated_sketch_id, None)
         self.activated_sketch_id = None
         self.sketch_editing = self.pending_sketch = False
-        self.restore_camera_style()
         self.history_edit_id = self.history_edit_graph = self.history_drag_name = self.history_drag_start = None
         self.history_origin_is_new = False
         body = self.plotter.actors.get('main_part')
@@ -957,6 +1246,7 @@ class ActionManager():
         for profile in self.profiles:
             self.plotter.remove_actor(profile['name'])
         self.profiles, self.selected_profile_index = [], None
+        self.selected_profile_indices.clear()
         self.active_normal = np.asarray(tuple(sketch.plane.z_dir), dtype=float)
         self.active_center = np.asarray(tuple(sketch.plane.origin), dtype=float)
         self.u_axis = np.asarray(tuple(sketch.plane.x_dir), dtype=float)
@@ -968,7 +1258,35 @@ class ActionManager():
                                           name=name, pickable=True, reset_camera=False)
             actor.SetPosition(*(self.active_normal * 1e-4))
             self.profiles.append({'name':name, 'face':face, 'sketch_id':feature_id, 'profile_index':index})
+        self._show_sketch_spatial_geometry(feature_id, sketch)
+        self.timeline_callback()
         return self.profiles
+
+    def _clear_sketch_spatial_actors(self):
+        for actor in self.sketch_spatial_actors:
+            self.plotter.remove_actor(actor, render=False)
+        self.sketch_spatial_actors.clear()
+        self.spatial_sketch_id = None
+
+    def _show_sketch_spatial_geometry(self, feature_id, sketch):
+        self._clear_sketch_spatial_actors()
+        edges = (*sketch.spatial_edges, *sketch.offset_edges, *sketch.corner_edges, *sketch.mirror_edges,
+                 *sketch.pattern_edges)
+        handles = (*sketch.mirror_points, *sketch.pattern_points)
+        if not edges and not handles:
+            return
+        self.spatial_sketch_id = feature_id
+        issues = self.parametric_graph.link_issues.get(feature_id, {})
+        for name, edge in edges:
+            color = '#a35a00' if name.partition(':')[0] in issues else '#087f84'
+            if name in sketch.mirror_construction_edges or name in sketch.pattern_construction_edges:
+                color = '#43889d'
+            self.sketch_spatial_actors.append(self.draw_sketch_edge(edge, color, 3, pickable=False))
+        if handles:
+            points = np.asarray([tuple(point) for _, point in handles])
+            self.sketch_spatial_actors.append(self.plotter.add_points(
+                points, color='#087f84', point_size=10, pickable=False, reset_camera=False, render=False))
+        self.plotter.render()
 
     def create_offset_plane(self, base, offset, origin=None, normal=None):
         normals = {"XY": (0, 0, 1), "XZ": (0, 1, 0), "YZ": (1, 0, 0)}
@@ -997,6 +1315,7 @@ class ActionManager():
             plane.update(origin=origin.tolist(), normal=normal.tolist())
         self.construction_planes.append(plane)
         self.status_callback(f"Created offset plane at distance {offset:g}.")
+        self.timeline_callback()
         return plane
 
     def create_plane_from_selected_face(self, offset):
@@ -1075,7 +1394,6 @@ class ActionManager():
         
         self.sketch_editing = True
         self.pending_sketch = True
-        self.lock_sketch_camera()
         self.sketch_intersection_points = []
         self.active_normal = np.asarray(normal, dtype=float)
         self.active_center = np.array(central_point)
@@ -1114,13 +1432,16 @@ class ActionManager():
         # Grid vertices and snapping use the same fixed basis, origin and step.
         # Bound the amount of geometry for extreme zoom-out.
         radius = min(250, max(10, int(np.ceil(self.plotter.camera.parallel_scale * 2 / self.grid_step))))
-        extent = radius * self.grid_step
+        u, v = self.get_local_pos_in_sketch(self.plotter.camera.focal_point)
+        u_center, v_center = round(u / self.grid_step), round(v / self.grid_step)
+        u_start, u_end = (u_center - radius) * self.grid_step, (u_center + radius) * self.grid_step
+        v_start, v_end = (v_center - radius) * self.grid_step, (v_center + radius) * self.grid_step
         points = []
         lines = []
         for index in range(-radius, radius + 1):
-            offset = index * self.grid_step
-            for a, b in (((offset, -extent), (offset, extent)),
-                         ((-extent, offset), (extent, offset))):
+            u_line, v_line = (u_center + index) * self.grid_step, (v_center + index) * self.grid_step
+            for a, b in (((u_line, v_start), (u_line, v_end)),
+                         ((u_start, v_line), (u_end, v_line))):
                 start = len(points)
                 points.extend((self.get_global_pos_in_sketch(a), self.get_global_pos_in_sketch(b)))
                 lines.extend((2, start, start + 1))
@@ -1158,8 +1479,19 @@ class ActionManager():
         if self.snap_to_points:
             points = self.get_active_sketch_points() + self.sketch_intersection_points
             if self.history_edit_graph is not None and self.history_edit_id is not None:
-                state = self.history_edit_graph.results[self.history_edit_id].constraint_status
-                points += [self.get_global_pos_in_sketch(point) for point in state.points.values()]
+                sketch = self.history_edit_graph.results[self.history_edit_id]
+                state = sketch.constraint_status
+                if state is not None:
+                    points += [self.get_global_pos_in_sketch(point) for point in state.points.values()]
+                points += [np.asarray(tuple(point)) for _, point in (*sketch.mirror_points, *sketch.pattern_points)]
+                for point in (*sketch.linked_points, *sketch.detached_points):
+                    world = np.asarray(tuple(point))
+                    if abs(np.dot(world - self.active_center, self.active_normal)) <= 1e-6:
+                        points.append(world)
+                for name, edge in (*sketch.linked_edges, *sketch.detached_edges, *sketch.offset_edges,
+                                   *sketch.corner_edges, *sketch.mirror_edges, *sketch.pattern_edges):
+                    if name not in sketch.off_plane_edge_names and not edge.is_closed:
+                        points.extend(np.asarray(tuple(edge.position_at(t))) for t in (0, 1))
             if points:
                 nearest = min(points, key=lambda point: np.linalg.norm(p_on_plane - point))
                 point_radius = self.plotter.camera.parallel_scale * 0.025
@@ -1254,6 +1586,7 @@ class ActionManager():
             self.plotter.remove_actor(profile["name"])
         self.profiles = []
         self.selected_profile_index = None
+        self.selected_profile_indices.clear()
         sketch = self.get_current_sketch_data()
         if not sketch:
             return []
@@ -1274,54 +1607,164 @@ class ActionManager():
         faces = list(self.current_part.faces())
         if self.selected_face_id >= len(faces):
             return False
-        face = faces[self.selected_face_id]
-        if face.geom_type != cad_core.GeomType.PLANE:
-            raise ValueError("Select a planar face for extrusion.")
-        self.active_normal = np.asarray(tuple(face.normal_at()), dtype=float)
-        self.profiles = [{"name": "temporary_selected_face", "face": face, "temporary": True}]
+        indices = [self.selected_face_id, *sorted(self.selected_face_ids - {self.selected_face_id})]
+        if any(not 0 <= index < len(faces) or faces[index].geom_type != cad_core.GeomType.PLANE for index in indices):
+            raise ValueError("Select planar faces for extrusion.")
+        self.active_normal = np.asarray(tuple(faces[indices[0]].normal_at()), dtype=float)
+        self.profiles = [{'name': f'temporary_selected_face_{index}', 'face': faces[index],
+                          'temporary': True, 'face_index': index} for index in indices]
         self.selected_profile_index = 0
+        self.selected_profile_indices = list(range(len(indices)))
         return True
 
     def clear_temporary_face_profile(self):
         if self.profiles and self.profiles[0].get("temporary"):
             self.profiles = []
             self.selected_profile_index = None
+            self.selected_profile_indices.clear()
+
+    def extrusion_profile_indices(self):
+        if self.selected_profile_index is None:
+            return ()
+        if self.selected_profile_index not in self.selected_profile_indices:
+            return (self.selected_profile_index,)
+        return tuple(self.selected_profile_indices)
+
+    def operation_geometry_selection(self, kind, index):
+        graph = self.parametric_graph
+        if graph is None:
+            return {'kind': kind, 'index': int(index)}
+        source_id = graph.latest_solid_id
+        reference = make_reference(source_id, self.current_part, 'edge' if kind == 'edge' else 'face',
+                                   int(index), graph.body_names.get(source_id))
+        return {'kind': kind, 'reference': reference}
+
+    def pick_extrusion_target(self, kind):
+        index, _ = self._get_face_under_mouse()
+        if index < 0:
+            raise ValueError('Click a face of the target object.')
+        return self.operation_geometry_selection(kind, index), int(index)
+
+    def extrusion_planes(self):
+        graph = self.parametric_graph
+        features = graph.features if graph is not None else ()
+        planes = [(f'{index}. {feature.name}', {'kind': 'plane', 'feature_id': feature.id})
+                  for index, feature in enumerate(features, start=1)
+                  if isinstance(graph.results.get(feature.id), cad_core.Plane)] if graph is not None else []
+        normals = {'XY': (0, 0, 1), 'XZ': (0, 1, 0), 'YZ': (1, 0, 0)}
+        for index, plane in enumerate(self.construction_planes, start=1):
+            normal = np.asarray(plane['normal'] if plane['base'] == 'face' else normals[plane['base']])
+            origin = np.asarray(plane.get('origin', (0, 0, 0))) + normal * plane['offset']
+            label = f"Offset plane {index} ({plane['base']}, {plane['offset']:g})"
+            planes.append((label, {'kind': 'plane', 'origin': origin.tolist(), 'normal': normal.tolist()}))
+        return planes
+
+    def sketch_axis_segments(self, index):
+        graph = self.parametric_graph
+        if graph is not None:
+            sketch = graph.results.get(self.profiles[index].get('sketch_id'))
+            return sketch.axis_segments if sketch else ()
+        segments = []
+        for tool in (self.get_current_sketch_data() or {}).get('sketch_func', []):
+            if tool.type != 'line':
+                continue
+            for first, second in zip(tool.points, tool.points[1:]):
+                start, end = np.asarray(first), np.asarray(second)
+                if np.linalg.norm(end - start) > 1e-9:
+                    segments.append(({'kind': 'coordinates', 'origin': start.tolist(), 'direction': (end - start).tolist()},
+                                     (start, end)))
+        return segments
+
+    def pick_revolution_axis(self, index, sketch_line):
+        if sketch_line:
+            segments = self.sketch_axis_segments(index)
+            edges = [cad_core.Edge.make_line(tuple(start), tuple(end)) for _, (start, end) in segments]
+            selected = self._nearest_edge(edges, range(len(edges)), samples=2)
+            if selected is None:
+                raise ValueError('Click a straight line of the sketch.')
+            selection = segments[selected][0]
+            self.revolution_axis_geometry(index, selection)
+            return selection, f'Sketch segment {selected + 1}'
+        edge_index = self._edge_at_cursor(straight_only=True)
+        if edge_index is not None:
+            selection = self.operation_geometry_selection('edge', edge_index)
+            _, direction = self.revolution_axis_geometry(index, selection)
+            selection['forward'] = list(direction)
+            return selection, f'Edge {edge_index + 1}'
+        face_index, _ = self._get_face_under_mouse()
+        if face_index >= 0:
+            selection = self.operation_geometry_selection('face', face_index)
+            _, direction = self.revolution_axis_geometry(index, selection)
+            selection['forward'] = list(direction)
+            return selection, f'Cylindrical face {face_index + 1}'
+        raise ValueError('Click a straight edge or a cylindrical face.')
 
     def build_extrusion(self, index, amount, operation="new_body", offset=0.0,
-                        taper=0.0, symmetric=False, second_distance=None, extent="distance"):
-        if not 0 <= index < len(self.profiles):
+                        taper=0.0, symmetric=False, second_distance=None, extent="distance", target=None, reverse=False):
+        indices = (index,) if isinstance(index, int) else index
+        if not indices or any(not 0 <= i < len(self.profiles) for i in indices):
             raise ValueError("Select a closed profile.")
-        return build_extrusion(self.profiles[index]["face"], self.active_normal, amount,
-                               operation, getattr(self, "current_part", None), offset, taper, symmetric, second_distance, extent)
+        graph = self.parametric_graph
+        base_id = graph.latest_solid_id if graph is not None else None
+        limit = extrusion_target(target, self.current_part, base_id, graph.body_names.get(base_id) if graph else None,
+                                 graph.results if graph else None) if extent == 'to_object' else None
+        return build_extrusion([self.profiles[i]["face"] for i in indices], self.active_normal, amount,
+                               operation, self.current_part, offset, taper, symmetric, second_distance, extent, limit, reverse)
 
     def commit_parametric_extrusion(self, index, distance, operation='new_body', offset=0.0,
-                                    taper=0.0, symmetric=False, second_distance=None, extent='distance'):
-        if self.parametric_graph is None or not 0 <= index < len(self.profiles):
-            raise ValueError('Select a parametric sketch profile.')
-        profile = self.profiles[index]
-        sketch_id = profile.get('sketch_id')
-        if not sketch_id or sketch_id not in self.parametric_graph.results:
-            raise ValueError('The selected profile is not part of a parametric sketch.')
-        base_id = next((item.id for item in reversed(self.parametric_graph.features)
-                        if item.id in self.parametric_graph.results and
-                        hasattr(self.parametric_graph.results[item.id], 'solids') and
-                        self.parametric_graph.results[item.id].solids()), None)
-        args = {'distance':float(distance), 'profile_index':profile['profile_index'], 'operation':operation,
-                'profile_count':len(self.parametric_graph.results[sketch_id].profiles),
-                'offset':float(offset), 'taper':float(taper), 'symmetric':bool(symmetric),
+                                    taper=0.0, symmetric=False, second_distance=None, extent='distance', target=None, reverse=False):
+        args = {'distance':float(distance), 'operation':operation, 'offset':float(offset),
+                'taper':float(taper), 'symmetric':bool(symmetric),
                 'second_distance':float(second_distance) if second_distance is not None else None, 'extent':extent}
-        keys = self.parametric_graph.results[sketch_id].profile_keys
-        key = keys[profile['profile_index']]
-        if key is not None:
-            args['profile_key'] = key
-        elif len(keys) > 1:
-            raise ValueError('The selected profile cannot be identified unambiguously after rebuild.')
+        if extent == 'to_object':
+            args.update(target=target, reverse=bool(reverse))
+        return self._commit_parametric_profile_feature(index, 'Extrude', 'extrude', args)
+
+    def commit_parametric_revolution(self, index, axis, angle, operation='new_body'):
+        args = {'angle':float(angle), 'operation':operation}
+        args['sketch_axis' if isinstance(axis, str) else 'axis_selection'] = axis
+        return self._commit_parametric_profile_feature(index, 'Revolve', 'revolve', args)
+
+    def _commit_parametric_profile_feature(self, index, name, kind, args):
+        indices = (index,) if isinstance(index, int) else index
+        if self.parametric_graph is None or not indices or any(not 0 <= i < len(self.profiles) for i in indices):
+            raise ValueError('Select a parametric sketch profile.')
+        profiles = [self.profiles[i] for i in indices]
+        base_id = self.parametric_graph.latest_solid_id
+        if kind == 'extrude' and all(profile.get('temporary') for profile in profiles):
+            input_id = base_id
+            args['profile_faces'] = [
+                self.operation_geometry_selection('face', profile['face_index'])['reference'] for profile in profiles
+            ]
+        else:
+            input_id = profiles[0].get('sketch_id')
+            sketch = self.parametric_graph.results.get(input_id)
+            if sketch is None:
+                raise ValueError('The selected profile is not part of a parametric sketch.')
+            if any(profile.get('sketch_id') != input_id for profile in profiles):
+                raise ValueError('Select profiles from the same sketch.')
+            if kind == 'extrude':
+                args['along_sketch_normal'] = True
+            selections = [self.profile_selection_parameters(sketch, profile['profile_index']) for profile in profiles]
+            if len(selections) == 1:
+                args.update(selections[0])
+            else:
+                args['profiles'] = selections
         if base_id: args['base_id'] = base_id
-        feature = Feature.create('Extrude', 'extrude', args, sketch_id)
+        feature = Feature.create(name, kind, args, input_id)
         graph = FeatureGraph([*self.parametric_graph.features, feature], self.parametric_graph.parameters)
         self.install_parametric_graph(graph)
         self.parametric_sketch_id = None
         return feature.id
+
+    @staticmethod
+    def profile_selection_parameters(sketch, index):
+        key = sketch.profile_keys[index]
+        if key is not None:
+            return {'profile_index': index, 'profile_count': len(sketch.profiles), 'profile_key': key}
+        if len(sketch.profiles) > 1:
+            raise ValueError('The selected profile cannot be identified unambiguously after rebuild.')
+        return {'profile_index': index, 'profile_count': len(sketch.profiles)}
 
     def extrude_profile(self, index, amount, operation="new_body", offset=0.0,
                         taper=0.0, symmetric=False, second_distance=None, extent="distance"):
@@ -1332,9 +1775,17 @@ class ActionManager():
     def build_revolution(self, index, axis, angle, operation="new_body"):
         if not 0 <= index < len(self.profiles):
             raise ValueError("Select a closed profile.")
-        direction = self.u_axis if axis == "horizontal" else self.v_axis
-        return build_revolution(self.profiles[index]["face"], self.active_center, direction,
-                                angle, operation, getattr(self, "current_part", None))
+        origin, direction = self.revolution_axis_geometry(index, axis)
+        return build_revolution(self.profiles[index]["face"], origin, direction, angle, operation, self.current_part)
+
+    def revolution_axis_geometry(self, index, axis):
+        if isinstance(axis, str):
+            return self.active_center, self.u_axis if axis == 'horizontal' else self.v_axis
+        graph = self.parametric_graph
+        source_id = graph.latest_solid_id if graph is not None else None
+        sketch = graph.results.get(self.profiles[index].get('sketch_id')) if graph else None
+        return revolution_axis(axis, sketch, self.current_part, source_id,
+                               graph.body_names.get(source_id) if graph else None)
 
     def build_primitive(self, kind, dimensions, position, operation):
         return build_primitive(kind, dimensions, position, operation, self.current_part)
@@ -1351,23 +1802,29 @@ class ActionManager():
         self.status_callback('Model converted; existing solid is a frozen base. Undo restores the snapshot history.')
 
     def install_parametric_graph(self, graph, record=True, reset_history=False, allow_empty=False):
-        # Rebuild has already succeeded; choose the last available solid result.
-        solid = next((graph.results[item.id] for item in reversed(graph.features)
-                      if item.id in graph.results and hasattr(graph.results[item.id], 'solids')
-                      and graph.results[item.id].solids()), None)
+        solid = graph.latest_solid
         if solid is None and self.current_part is not None and not allow_empty:
             raise ValueError('The graph has no active solid result.')
         previous = self.parametric_graph.to_data() if self.parametric_graph is not None else None
+        visible_spatial = None
+        if not reset_history and not self.sketch_editing and any(actor.GetVisibility() for actor in self.sketch_spatial_actors):
+            visible_spatial = self.spatial_sketch_id
         if solid is not None:
             self.display_result(solid)
         else:
-            self.plotter.remove_actor('main_part')
-            self.current_part = None
+            self._clear_sketch_spatial_actors()
+            if self.current_part is not None:
+                self._restore_result(None)
+            else:
+                self.plotter.remove_actor('main_part')
             self.pending_sketch = False
+            self.profile_selection_callback = None
+            self.selecting_multiple_profiles = False
             for profile in self.profiles:
                 self.plotter.remove_actor(profile['name'])
             self.profiles = []
             self.selected_profile_index = None
+            self.selected_profile_indices.clear()
         self.parametric_graph = graph
         if reset_history or previous is None:
             self.graph_undo.clear()
@@ -1378,6 +1835,8 @@ class ActionManager():
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.timeline = Timeline()
+        if visible_spatial in graph.results:
+            self._show_sketch_spatial_geometry(visible_spatial, graph.results[visible_spatial])
         self.timeline_callback()
 
     def commit_result(self, part, title="Solid operation", parameters=None):
@@ -1402,6 +1861,7 @@ class ActionManager():
             self.edge_selection_mode = False
             self.current_part = None
             self.selected_face_id = -1
+            self.selected_face_ids.clear()
             self.hover_id = -1
             self._clear_highlight(render=False)
             self.plotter.remove_actor("main_part")
@@ -1500,7 +1960,9 @@ class ActionManager():
     def display_result(self, part):
         # Prepare the display mesh before committing or removing the existing scene.
         pv_mesh = b123d_to_pro_mesh(part, 0.001, 0.05)
+        self._clear_sketch_spatial_actors()
         self.selected_face_id = -1
+        self.selected_face_ids.clear()
         self.hover_id = -1
         self._clear_highlight(render=False)
         self.clear_selected_edges()
@@ -1508,7 +1970,9 @@ class ActionManager():
         self.current_part = part
         self.pending_sketch = False
         self.profile_selection_callback = None
+        self.selecting_multiple_profiles = False
         self.selected_profile_index = None
+        self.selected_profile_indices.clear()
         for profile in self.profiles:
             self.plotter.remove_actor(profile["name"])
         self.profiles = []
@@ -1527,10 +1991,10 @@ class ActionManager():
 
         actor = self.plotter.add_mesh(
             pv_mesh,
-            color="#b0b0b0",
+            color="#d1d8e2",
             pbr=True,
-            metallic=0.3,
-            roughness=0.4,
+            metallic=0.15,
+            roughness=0.48,
             smooth_shading=True,
             show_edges=False,
             split_sharp_edges=True,

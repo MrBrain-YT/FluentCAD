@@ -7,6 +7,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 
 def open_window():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle('Fusion')
     splash = show_splash_screen()
     window = QtWidgets.QMainWindow()
     window.setWindowTitle("Fluent CAD")
